@@ -1,0 +1,5 @@
+.docs
+.env
+/build
+
+CMakeUserPresets.json
