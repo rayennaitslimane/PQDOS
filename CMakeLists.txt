@@ -16,6 +16,7 @@ find_package(msgpack REQUIRED)
 add_library(pqdos
     core/ErasureCodec.cpp
     core/Crypto.cpp
+    core/MetadataStore.cpp
 )
 
 target_include_directories(pqdos PUBLIC
@@ -36,6 +37,7 @@ if(BUILD_TESTING)
     add_executable(pqdos_tests
         tests/ErasureCodecTest.cpp
         tests/CryptoTest.cpp
+        tests/MetadataStoreTest.cpp
     )
 
     target_link_libraries(pqdos_tests PRIVATE

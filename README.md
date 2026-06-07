@@ -22,9 +22,15 @@ cmake --build --preset conan-release
 ## Testing
 
 ```bash
+# Start PostgreSQL test database
+docker compose up -d postgres-test
+
 # Find test executable
 find . -name pqdos_tests
 
 # Run tests
 ./build/Release/pqdos_tests
+
+# Turn off the postgres-test container
+docker compose stop postgres-test
 ```

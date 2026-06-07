@@ -10,7 +10,34 @@ using Bytes = std::vector<uint8_t>;
 struct ErasureSpec {
     uint32_t data_shards = 0;
     uint32_t parity_shards = 0;
-    size_t shard_size = 0;
+    std::size_t shard_size = 0;
+
+    MSGPACK_DEFINE(data_shards, parity_shards, shard_size);
+
+    Bytes serialize() const {
+        msgpack::sbuffer sbuf;
+        msgpack::pack(sbuf, *this);
+
+        return Bytes(
+            reinterpret_cast<const uint8_t*>(sbuf.data()),
+            reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size()
+        );
+    }
+
+    static ErasureSpec deserialize(const Bytes& data) {
+        if (data.empty()) {
+            throw std::invalid_argument("ErasureSpec::deserialize: empty buffer");
+        }
+
+        msgpack::object_handle handle = msgpack::unpack(
+            reinterpret_cast<const char*>(data.data()),
+            data.size()
+        );
+
+        ErasureSpec result;
+        handle.get().convert(result);
+        return result;
+    }
 };
 
 struct ObjectMetadata {
