@@ -31,7 +31,7 @@ std::string BytesToString(const Bytes& bytes) {
 
 }  // namespace
 
-TEST(ErasureCodecBlackBoxTest, HappyEncodeDecodePath) {
+TEST(ErasureCodecTest, HappyEncodeDecodePath) {
     ErasureSpec spec;
     spec.data_shards = 4;
     spec.parity_shards = 2;
@@ -55,7 +55,7 @@ TEST(ErasureCodecBlackBoxTest, HappyEncodeDecodePath) {
     EXPECT_EQ(decoded, original);
 }
 
-TEST(ErasureCodecBlackBoxTest, DecodeSucceedsWhenSomeDataShardsAreDestroyed) {
+TEST(ErasureCodecTest, DecodeSucceedsWhenSomeDataShardsAreDestroyed) {
     ErasureSpec spec;
     spec.data_shards = 4;
     spec.parity_shards = 2;
@@ -85,7 +85,7 @@ TEST(ErasureCodecBlackBoxTest, DecodeSucceedsWhenSomeDataShardsAreDestroyed) {
     EXPECT_EQ(decoded, original);
 }
 
-TEST(ErasureCodecBlackBoxTest, StringRoundTripSucceedsAfterShardLoss) {
+TEST(ErasureCodecTest, StringRoundTripSucceedsAfterShardLoss) {
     ErasureSpec spec;
     spec.data_shards = 4;
     spec.parity_shards = 2;
@@ -127,7 +127,7 @@ TEST(ErasureCodecBlackBoxTest, StringRoundTripSucceedsAfterShardLoss) {
     printf("Decoded text: %s\n", decoded_text.c_str());
 }
 
-TEST(ErasureCodecBlackBoxTest, DecodeSucceedsForLargeDataWithPartialDestruction) {
+TEST(ErasureCodecTest, DecodeSucceedsForLargeDataWithPartialDestruction) {
     ErasureSpec spec;
     spec.data_shards = 20;
     spec.parity_shards = 10;

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <msgpack.hpp>
 
 using Bytes = std::vector<uint8_t>;
 
@@ -29,4 +30,33 @@ struct EncryptedShard {
     uint32_t index = 0;
     Bytes nonce;
     Bytes ciphertext;
+
+    MSGPACK_DEFINE(index, nonce, ciphertext);
+
+    // Serialize method
+    Bytes serialize() const {
+        msgpack::sbuffer sbuf;
+        msgpack::pack(sbuf, *this);
+
+        return Bytes(
+            reinterpret_cast<const uint8_t*>(sbuf.data()),
+            reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size()
+        );
+    }
+
+    // Deserialize method
+    static EncryptedShard deserialize(const Bytes& data) {
+        if (data.empty()) {
+            throw std::invalid_argument("deserialize: empty buffer");
+        }
+
+        msgpack::object_handle handle = msgpack::unpack(
+            reinterpret_cast<const char*>(data.data()),
+            data.size()
+        );
+
+        EncryptedShard result;
+        handle.get().convert(result);
+        return result;
+    }
 };

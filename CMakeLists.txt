@@ -11,20 +11,23 @@ find_package(isa-l REQUIRED)
 find_package(libpqxx REQUIRED)
 find_package(botan REQUIRED)
 find_package(lmdb REQUIRED)
+find_package(msgpack REQUIRED)
 
 add_library(pqdos
     core/ErasureCodec.cpp
+    core/Crypto.cpp
 )
 
 target_include_directories(pqdos PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 
-target_link_libraries(pqdos PRIVATE
+target_link_libraries(pqdos PUBLIC
     isa-l::isa-l
     libpqxx::pqxx
     botan::botan
     lmdb::lmdb
+    msgpack-cxx
 )
 
 if(BUILD_TESTING)
@@ -32,6 +35,7 @@ if(BUILD_TESTING)
 
     add_executable(pqdos_tests
         tests/ErasureCodecTest.cpp
+        tests/CryptoTest.cpp
     )
 
     target_link_libraries(pqdos_tests PRIVATE
