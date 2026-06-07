@@ -19,6 +19,7 @@ add_library(pqdos
     core/Crypto.cpp
     core/MetadataStore.cpp
     core/StorageNode.cpp
+    core/StorageClient.cpp
 )
 
 target_include_directories(pqdos PUBLIC
@@ -36,21 +37,22 @@ target_link_libraries(pqdos PUBLIC
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
 
-    add_executable(pqdos_tests
+    add_executable(pqdos_unit_tests
         tests/ErasureCodecTest.cpp
         tests/CryptoTest.cpp
     )
 
-    target_link_libraries(pqdos_tests PRIVATE
+    target_link_libraries(pqdos_unit_tests PRIVATE
         pqdos
         GTest::gtest_main
     )
 
-    add_test(NAME pqdos_tests COMMAND pqdos_tests)
+    add_test(NAME pqdos_unit_tests COMMAND pqdos_unit_tests)
 
     add_executable(pqdos_integration_tests
         tests/MetadataStoreTest.cpp
         tests/StorageNodeTest.cpp
+        tests/StorageClientTest.cpp
     )
 
     target_link_libraries(pqdos_integration_tests

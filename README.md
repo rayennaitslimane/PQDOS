@@ -25,10 +25,10 @@ cmake --build --preset conan-release
 
 ```bash
 # Find test executable
-find . -name pqdos_tests
+find . -name pqdos_unit_tests
 
 # Run unit tests
-./build/Release/pqdos_tests
+./build/Release/pqdos_unit_tests
 ```
 
 ### Integration tests (postgres / lmdb)

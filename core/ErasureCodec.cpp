@@ -116,7 +116,7 @@ std::vector<PlainShard> encode(Bytes& data, ErasureSpec& erasure_spec) {
     return shards;
 }
 
-Bytes decode(const std::vector<PlainShard>& shards, ErasureSpec& erasure_spec, size_t original_size) {
+Bytes decode(const std::vector<PlainShard>& shards, const ErasureSpec& erasure_spec, size_t original_size) {
     const uint32_t k = erasure_spec.data_shards;
     const uint32_t m = erasure_spec.parity_shards;
     const uint32_t n = k + m;

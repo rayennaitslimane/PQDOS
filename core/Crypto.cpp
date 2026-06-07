@@ -77,22 +77,24 @@ std::vector<PlainShard> decrypt_shards(
 
         auto buf = e.ciphertext;
 
-        // same AAD must be used
-        dec->set_associated_data(
-            reinterpret_cast<const uint8_t*>(&e.index),
-            sizeof(e.index)
-        );
-
-        dec->start(e.nonce.data(), e.nonce.size());
-
         try {
-            dec->finish(buf); // verifies integrity
-        } catch (const Botan::Integrity_Failure&) {
-            throw std::runtime_error("Shard integrity verification failed");
-        }
+            dec->set_associated_data(
+                reinterpret_cast<const uint8_t*>(&e.index),
+                sizeof(e.index)
+            );
 
-        shard.bytes = std::move(buf);
-        plain.push_back(std::move(shard));
+            dec->start(e.nonce.data(), e.nonce.size());
+            dec->finish(buf);
+
+            shard.bytes = std::move(buf);
+            plain.push_back(std::move(shard));
+        } catch (const Botan::Integrity_Failure&) {
+            // Skip corrupted shard, continue with others
+            continue;
+        } catch (...) {
+            // Skip malformed shard, continue
+            continue;
+        }
     }
 
     return plain;
