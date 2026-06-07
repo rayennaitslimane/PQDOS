@@ -126,3 +126,33 @@ TEST(ErasureCodecBlackBoxTest, StringRoundTripSucceedsAfterShardLoss) {
     // Print decoded text for debugging
     printf("Decoded text: %s\n", decoded_text.c_str());
 }
+
+TEST(ErasureCodecBlackBoxTest, DecodeSucceedsForLargeDataWithPartialDestruction) {
+    ErasureSpec spec;
+    spec.data_shards = 20;
+    spec.parity_shards = 10;
+    spec.shard_size = 8;
+
+    // 29 bytes still fits in 32 bytes total capacity.
+    Bytes original = MakeTestData(160);
+
+    std::vector<PlainShard> all_shards = encode(original, spec);
+    ASSERT_EQ(all_shards.size(), spec.data_shards + spec.parity_shards);
+
+    // Simulate destruction of two DATA shards.
+    // This forces decode() to go through reconstruction logic.
+    std::vector<PlainShard> surviving_shards;
+    for (const auto& shard : all_shards) {
+        if (shard.index == 1 || shard.index == 3) {
+            continue;  // destroyed
+        }
+        surviving_shards.push_back(shard);
+    }
+
+    // We still have exactly k >= 20 shards left:
+    ASSERT_EQ(surviving_shards.size(), all_shards.size() - 2);
+
+    Bytes decoded = decode(surviving_shards, spec, original.size());
+
+    EXPECT_EQ(decoded, original);
+}
