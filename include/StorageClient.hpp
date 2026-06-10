@@ -2,15 +2,17 @@
 
 #include "MetadataStore.hpp"
 #include "Models.hpp"
-#include "StorageNode.hpp"
 
+#include <botan/pk_keys.h>
+
+#include <array>
 #include <memory>
 #include <string>
-#include <unordered_map>
 
 class StorageClient {
 public:
     explicit StorageClient(const std::string& metadata_conn_str);
+    ~StorageClient();
 
     void init();
     void put(const std::string& object_id, const Bytes& bytes);
@@ -26,5 +28,6 @@ public:
 
 private:
     MetadataStore metadata_store_;
-    std::unordered_map<std::string, std::unique_ptr<StorageNode>> nodes_;
+    std::unique_ptr<Botan::Private_Key> kek_;
+    std::string kek_id_;
 };

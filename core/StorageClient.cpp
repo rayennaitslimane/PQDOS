@@ -3,6 +3,11 @@
 #include "Crypto.hpp"
 #include "ErasureCodec.hpp"
 
+#include <botan/auto_rng.h>
+#include <botan/mem_ops.h>
+#include <botan/pk_algs.h>
+#include <httplib.h>
+
 #include <array>
 #include <cstdint>
 #include <iomanip>
@@ -26,20 +31,30 @@ constexpr uint32_t kDataShards = 2;
 constexpr uint32_t kParityShards = 1;
 constexpr std::size_t kShardSize = 20;
 
-// Replace these paths with your real node paths.
-const std::array<std::string, kNumNodes> kNodePaths = {
-    "./data/node1",
-    "./data/node2",
-    "./data/node3"
-};
+std::array<std::string, kNumNodes> parseNodeAddresses() {
+    const char* env = std::getenv("NODE_ADDRESSES");
+    if (!env) {
+        return {"localhost:9001", "localhost:9002", "localhost:9003"};
+    }
+    std::array<std::string, kNumNodes> addresses;
+    std::istringstream stream(env);
+    std::string token;
+    std::size_t i = 0;
+    while (std::getline(stream, token, ',') && i < kNumNodes) {
+        addresses[i++] = token;
+    }
+    if (i != kNumNodes) {
+        throw std::runtime_error(
+            "NODE_ADDRESSES must contain exactly 3 comma-separated addresses"
+        );
+    }
+    return addresses;
+}
 
-// Demo / MVP master key (32 bytes)
-const std::array<uint8_t, 32> kMasterKey = {
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F
-};
+const std::array<std::string, kNumNodes> kNodeAddresses = parseNodeAddresses();
+
+// Demo / MVP KEK (ML-KEM-768 keypair generated at construction)
+const std::string kKEKId = "kek-001";
 
 // =========================
 // Internal types
@@ -47,7 +62,7 @@ const std::array<uint8_t, 32> kMasterKey = {
 
 // Placement map:
 // {
-//   "nodepath" -> [
+//   "host:port" -> [
 //      ("object_id-shard_id", serialized_shard_bytes),
 //      ...
 //   ]
@@ -85,6 +100,15 @@ ErasureSpec make_erasure_spec() {
     return spec;
 }
 
+std::pair<std::string, int> parse_address(const std::string& address) {
+    const auto pos = address.rfind(':');
+    if (pos == std::string::npos) {
+        throw std::runtime_error("parse_address: invalid address: " + address);
+    }
+
+    return {address.substr(0, pos), std::stoi(address.substr(pos + 1))};
+}
+
 // MVP placement strategy:
 // - one shard per node
 // - shard i goes to node i
@@ -94,7 +118,7 @@ PlacementMap placement_strategy(
 ) {
     const std::size_t total_shards = serialized_shards.size();
 
-    if (total_shards > kNodePaths.size()) {
+    if (total_shards > kNodeAddresses.size()) {
         throw std::runtime_error(
             "placement_strategy: not enough nodes for number of shards"
         );
@@ -103,55 +127,52 @@ PlacementMap placement_strategy(
     PlacementMap placement;
 
     for (std::size_t i = 0; i < total_shards; ++i) {
-        const std::string& node_path = kNodePaths[i];
+        const std::string& node_address = kNodeAddresses[i];
         const std::string location = make_shard_location(
             object_id,
             static_cast<uint32_t>(i)
         );
 
-        placement[node_path].push_back({location, serialized_shards[i]});
+        placement[node_address].push_back({location, serialized_shards[i]});
     }
 
     return placement;
 }
 
-void apply_placement(
-    const PlacementMap& placement,
-    const std::unordered_map<std::string, std::unique_ptr<StorageNode>>& nodes
-) {
-    for (const auto& [node_path, entries] : placement) {
-        auto it = nodes.find(node_path);
-        if (it == nodes.end() || it->second == nullptr) {
-            throw std::runtime_error(
-                "apply_placement: node not initialized for path: " + node_path
-            );
-        }
-
-        std::vector<std::string> locations;
-        std::vector<Bytes> payloads;
-        locations.reserve(entries.size());
-        payloads.reserve(entries.size());
+void apply_placement(const PlacementMap& placement) {
+    for (const auto& [node_address, entries] : placement) {
+        auto [host, port] = parse_address(node_address);
+        httplib::Client client(host, port);
 
         for (const auto& [location, payload] : entries) {
-            locations.push_back(location);
-            payloads.push_back(payload);
-        }
+            auto res = client.Put(
+                "/shards/" + location,
+                reinterpret_cast<const char*>(payload.data()),
+                payload.size(),
+                "application/octet-stream"
+            );
 
-        it->second->put(locations, payloads);
+            if (!res || res->status != 200) {
+                throw std::runtime_error(
+                    "apply_placement: failed to PUT shard to " +
+                    node_address + "/shards/" + location
+                );
+            }
+        }
     }
 }
 
-// Build metadata.shard_locations as an ordered vector of node paths.
+// Build metadata.shard_locations as an ordered vector of "host:port/location".
 // The index in the vector equals the shard index.
 std::vector<std::string> build_shard_locations(const PlacementMap& placement) {
     std::size_t total_shards = 0;
-    for (const auto& [node_path, entries] : placement) {
+    for (const auto& [node_address, entries] : placement) {
         total_shards += entries.size();
     }
 
     std::vector<std::string> shard_locations(total_shards);
 
-    for (const auto& [node_path, entries] : placement) {
+    for (const auto& [node_address, entries] : placement) {
         for (const auto& [location, payload] : entries) {
             const auto pos = location.rfind('-');
             if (pos == std::string::npos) {
@@ -159,7 +180,7 @@ std::vector<std::string> build_shard_locations(const PlacementMap& placement) {
             }
 
             const std::size_t shard_index = std::stoul(location.substr(pos + 1));
-            shard_locations.at(shard_index) = node_path + "/" + location;
+            shard_locations.at(shard_index) = node_address + "/" + location;
         }
     }
 
@@ -170,77 +191,83 @@ ShardLocationMap parse_shard_locations(const std::vector<std::string>& shard_loc
     ShardLocationMap result;
 
     for (const auto& shard_location : shard_locations) {
-        const auto pos = shard_location.rfind('/');
+        const auto pos = shard_location.find('/');
         if (pos == std::string::npos) {
             throw std::runtime_error("parse_shard_locations: invalid shard location");
         }
 
-        const std::string node_path = shard_location.substr(0, pos);
+        const std::string node_address = shard_location.substr(0, pos);
         const std::string location = shard_location.substr(pos + 1);
 
-        result[node_path].push_back(location);
+        result[node_address].push_back(location);
     }
 
     return result;
 }
 
 std::vector<EncryptedShard> fetch_encrypted_shards(
-    const ShardLocationMap& shard_location_map,
-    const std::unordered_map<std::string, std::unique_ptr<StorageNode>>& nodes
+    const ShardLocationMap& shard_location_map
 ) {
     std::vector<EncryptedShard> encrypted_shards;
 
-    for (const auto& [node_path, locations] : shard_location_map) {
-        auto it = nodes.find(node_path);
+    for (const auto& [node_address, locations] : shard_location_map) {
+        std::pair<std::string, int> addr;
 
-        // Missing node -> tolerate and continue
-        if (it == nodes.end() || it->second == nullptr) {
+        try {
+            addr = parse_address(node_address);
+        } catch (...) {
             continue;
         }
 
-        try {
-            const auto payloads = it->second->get(locations);
+        httplib::Client client(addr.first, addr.second);
 
-            const std::size_t count = std::min(payloads.size(), locations.size());
+        for (const auto& location : locations) {
+            try {
+                auto res = client.Get("/shards/" + location);
 
-            for (std::size_t i = 0; i < count; ++i) {
-                if (!payloads[i].has_value()) {
+                if (!res || res->status != 200) {
                     continue; // missing shard
                 }
 
+                Bytes payload(res->body.begin(), res->body.end());
+
                 try {
                     encrypted_shards.push_back(
-                        EncryptedShard::deserialize(*payloads[i])
+                        EncryptedShard::deserialize(payload)
                     );
                 } catch (...) {
                     // malformed/corrupt serialized shard -> ignore
                     continue;
                 }
+            } catch (...) {
+                // node unavailable
+                continue;
             }
-        } catch (...) {
-            // node unavailable, filesystem path deleted, etc.
-            continue;
         }
     }
 
     return encrypted_shards;
 }
 
-void remove_from_nodes(
-    const ShardLocationMap& shard_location_map,
-    const std::unordered_map<std::string, std::unique_ptr<StorageNode>>& nodes
-) {
-    for (const auto& [node_path, locations] : shard_location_map) {
-        auto it = nodes.find(node_path);
-        if (it == nodes.end() || it->second == nullptr) {
+void remove_from_nodes(const ShardLocationMap& shard_location_map) {
+    for (const auto& [node_address, locations] : shard_location_map) {
+        std::pair<std::string, int> addr;
+
+        try {
+            addr = parse_address(node_address);
+        } catch (...) {
             continue;
         }
 
-        try {
-            (void)it->second->remove(locations);
-        } catch (...) {
-            // Ignore missing node / already-deleted shard / backend failure
-            continue;
+        httplib::Client client(addr.first, addr.second);
+
+        for (const auto& location : locations) {
+            try {
+                (void)client.Delete("/shards/" + location);
+            } catch (...) {
+                // Ignore missing node / already-deleted shard / backend failure
+                continue;
+            }
         }
     }
 }
@@ -252,17 +279,28 @@ void remove_from_nodes(
 // =========================
 
 StorageClient::StorageClient(const std::string& metadata_conn_str)
-    : metadata_store_(metadata_conn_str) {
+    : metadata_store_(metadata_conn_str), kek_id_(kKEKId) {
+    Botan::AutoSeeded_RNG rng;
+    kek_ = Botan::create_private_key("ML-KEM", rng, "ML-KEM-768");
+    if (!kek_) {
+        throw std::runtime_error("StorageClient: failed to create ML-KEM-768 key");
+    }
 }
 
-void StorageClient::init() {
-    nodes_.clear();
+StorageClient::~StorageClient() = default;
 
-    for (const auto& node_path : kNodePaths) {
-        nodes_.emplace(
-            node_path,
-            std::make_unique<StorageNode>(node_path.c_str())
-        );
+void StorageClient::init() {
+    for (const auto& node_address : kNodeAddresses) {
+        auto [host, port] = parse_address(node_address);
+        httplib::Client client(host, port);
+
+        auto res = client.Get("/health");
+
+        if (!res || res->status != 200) {
+            throw std::runtime_error(
+                "StorageClient::init: node not healthy: " + node_address
+            );
+        }
     }
 }
 
@@ -273,12 +311,6 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes) {
 
     if (bytes.empty()) {
         throw std::invalid_argument("StorageClient::put: bytes cannot be empty");
-    }
-
-    if (nodes_.size() != kNumNodes) {
-        throw std::runtime_error(
-            "StorageClient::put: nodes are not initialized; call init() first"
-        );
     }
 
     // 1) Generate checksum from bytes
@@ -301,15 +333,22 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes) {
         );
     }
 
-    // 4) Encrypt and serialize each plain shard into ordered vector of bytes
+    // 4) Generate per-object DEK, encrypt shards, wrap DEK with KEK
+    Botan::AutoSeeded_RNG rng;
+    std::array<uint8_t, 32> dek;
+    rng.randomize(dek.data(), dek.size());
+
     std::vector<EncryptedShard> encrypted_shards =
-        encrypt_shards(plain_shards, kMasterKey);
+        encrypt_shards(plain_shards, dek);
 
     if (encrypted_shards.size() != plain_shards.size()) {
         throw std::runtime_error(
             "StorageClient::put: encrypt_shards() returned unexpected number of shards"
         );
     }
+
+    Bytes wrapped_dek = encrypt_dek(dek, *kek_->public_key());
+    Botan::secure_scrub_memory(dek.data(), dek.size());
 
     std::vector<Bytes> serialized_shards;
     serialized_shards.reserve(encrypted_shards.size());
@@ -321,8 +360,8 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes) {
     // 5) placement_strategy(serialized_shards)
     PlacementMap placement = placement_strategy(object_id, serialized_shards);
 
-    // 6) apply_placement(map)
-    apply_placement(placement, nodes_);
+    // 6) apply_placement(map) over HTTP
+    apply_placement(placement);
 
     // 7) Generate metadata and store using MetadataStore
     ObjectMetadata metadata;
@@ -331,6 +370,8 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes) {
     metadata.checksum = checksum_hex;
     metadata.erasure = erasure_spec;
     metadata.shard_locations = build_shard_locations(placement);
+    metadata.encrypted_dek = wrapped_dek;
+    metadata.kek_id = kek_id_;
 
     metadata_store_.put(metadata);
 }
@@ -338,12 +379,6 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes) {
 Bytes StorageClient::get(const std::string& object_id) {
     if (object_id.empty()) {
         throw std::invalid_argument("StorageClient::get: object_id cannot be empty");
-    }
-
-    if (nodes_.size() != kNumNodes) {
-        throw std::runtime_error(
-            "StorageClient::get: nodes are not initialized; call init() first"
-        );
     }
 
     // 1) Load metadata
@@ -355,13 +390,13 @@ Bytes StorageClient::get(const std::string& object_id) {
     const ObjectMetadata& metadata = *metadata_opt;
 
     // 2) Parse shard locations into:
-    //    { "node_id" -> vector<"object_id-shard_id"> }
+    //    { "host:port" -> vector<"object_id-shard_id"> }
     const ShardLocationMap shard_location_map =
         parse_shard_locations(metadata.shard_locations);
 
-    // 3) Fetch encrypted shard payloads from nodes
+    // 3) Fetch encrypted shard payloads from nodes over HTTP
     std::vector<EncryptedShard> encrypted_shards =
-        fetch_encrypted_shards(shard_location_map, nodes_);
+        fetch_encrypted_shards(shard_location_map);
 
     if (encrypted_shards.size() < metadata.erasure.data_shards) {
         throw std::runtime_error(
@@ -369,9 +404,13 @@ Bytes StorageClient::get(const std::string& object_id) {
         );
     }
 
-    // 4) Decrypt shards
+    // 4) Decrypt DEK and decrypt shards
+    std::array<uint8_t, 32> dek = decrypt_dek(metadata.encrypted_dek, *kek_);
+
     const std::vector<PlainShard> plain_shards =
-        decrypt_shards(encrypted_shards, kMasterKey);
+        decrypt_shards(encrypted_shards, dek);
+
+    Botan::secure_scrub_memory(dek.data(), dek.size());
 
     // 5) Decode original bytes
     if (plain_shards.size() < metadata.erasure.data_shards) {
@@ -396,12 +435,6 @@ bool StorageClient::remove(const std::string& object_id) {
         throw std::invalid_argument("StorageClient::remove: object_id cannot be empty");
     }
 
-    if (nodes_.size() != kNumNodes) {
-        throw std::runtime_error(
-            "StorageClient::remove: nodes are not initialized; call init() first"
-        );
-    }
-
     // 1) Load metadata
     const auto metadata_opt = metadata_store_.get(object_id);
     if (!metadata_opt.has_value()) {
@@ -411,12 +444,12 @@ bool StorageClient::remove(const std::string& object_id) {
     const ObjectMetadata& metadata = *metadata_opt;
 
     // 2) Parse metadata shard locations into:
-    //    { "node_id" -> vector<"object_id-shard_id"> }
+    //    { "host:port" -> vector<"object_id-shard_id"> }
     const ShardLocationMap shard_location_map =
         parse_shard_locations(metadata.shard_locations);
 
-    // 3) Remove shard payloads from storage nodes
-    remove_from_nodes(shard_location_map, nodes_);
+    // 3) Remove shard payloads from storage nodes over HTTP
+    remove_from_nodes(shard_location_map);
 
     // 4) Remove metadata
     return metadata_store_.remove(object_id);

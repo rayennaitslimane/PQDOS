@@ -13,13 +13,17 @@ find_package(libpqxx REQUIRED)
 find_package(botan REQUIRED)
 find_package(lmdb REQUIRED)
 find_package(msgpack REQUIRED)
+find_package(httplib REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
 add_library(pqdos
     core/ErasureCodec.cpp
     core/Crypto.cpp
     core/MetadataStore.cpp
     core/StorageNode.cpp
+    core/StorageNodeServer.cpp
     core/StorageClient.cpp
+    core/StorageClientServer.cpp
 )
 
 target_include_directories(pqdos PUBLIC
@@ -32,6 +36,8 @@ target_link_libraries(pqdos PUBLIC
     botan::botan
     lmdb::lmdb
     msgpack-cxx
+    httplib::httplib
+    nlohmann_json::nlohmann_json
 )
 
 if(BUILD_TESTING)
@@ -52,7 +58,9 @@ if(BUILD_TESTING)
     add_executable(pqdos_integration_tests
         tests/MetadataStoreTest.cpp
         tests/StorageNodeTest.cpp
+        tests/StorageNodeServerTest.cpp
         tests/StorageClientTest.cpp
+        tests/StorageClientServerTest.cpp
     )
 
     target_link_libraries(pqdos_integration_tests
@@ -67,7 +75,13 @@ if(BUILD_TESTING)
     )
 endif()
 
-install(TARGETS pqdos
+add_executable(storage_node cmd/StorageNodeMain.cpp)
+target_link_libraries(storage_node PRIVATE pqdos)
+
+add_executable(storage_client cmd/StorageClientMain.cpp)
+target_link_libraries(storage_client PRIVATE pqdos)
+
+install(TARGETS pqdos storage_node storage_client
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin

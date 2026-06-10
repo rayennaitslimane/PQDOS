@@ -22,7 +22,9 @@ void MetadataStore::init_schema() {
             id UUID PRIMARY KEY,
             size BIGINT NOT NULL CHECK (size >= 0),
             checksum TEXT NOT NULL,
-            erasure_spec BYTEA NOT NULL
+            erasure_spec BYTEA NOT NULL,
+            encrypted_dek BYTEA NOT NULL,
+            kek_id TEXT NOT NULL
         );
     )SQL");
 
@@ -62,13 +64,22 @@ void MetadataStore::put(const ObjectMetadata& metadata) {
         erasure_blob.push_back(static_cast<std::byte>(byte));
     }
 
+    pqxx::bytes encrypted_dek_blob;
+    encrypted_dek_blob.reserve(metadata.encrypted_dek.size());
+
+    for (const auto byte : metadata.encrypted_dek) {
+        encrypted_dek_blob.push_back(static_cast<std::byte>(byte));
+    }
+
     tx.exec(
         pqxx::prepped{"put_object_metadata"},
         pqxx::params{
             metadata.id,
             object_size,
             metadata.checksum,
-            erasure_blob
+            erasure_blob,
+            encrypted_dek_blob,
+            metadata.kek_id
         }
     );
 
@@ -163,19 +174,25 @@ void MetadataStore::prepare_statements() {
                 id,
                 size,
                 checksum,
-                erasure_spec
+                erasure_spec,
+                encrypted_dek,
+                kek_id
             )
             VALUES (
                 $1::uuid,
                 $2,
                 $3,
-                $4::bytea
+                $4::bytea,
+                $5::bytea,
+                $6
             )
             ON CONFLICT (id) DO UPDATE
             SET
                 size = EXCLUDED.size,
                 checksum = EXCLUDED.checksum,
-                erasure_spec = EXCLUDED.erasure_spec
+                erasure_spec = EXCLUDED.erasure_spec,
+                encrypted_dek = EXCLUDED.encrypted_dek,
+                kek_id = EXCLUDED.kek_id
         )SQL"
     );
 
@@ -210,7 +227,9 @@ void MetadataStore::prepare_statements() {
                 id::text,
                 size,
                 checksum,
-                erasure_spec
+                erasure_spec,
+                encrypted_dek,
+                kek_id
             FROM object_metadata
             WHERE id = $1::uuid
         )SQL"
@@ -241,7 +260,9 @@ void MetadataStore::prepare_statements() {
                 id::text,
                 size,
                 checksum,
-                erasure_spec
+                erasure_spec,
+                encrypted_dek,
+                kek_id
             FROM object_metadata
             ORDER BY id ASC
         )SQL"
@@ -271,6 +292,15 @@ ObjectMetadata MetadataStore::row_to_object_metadata(const pqxx::row_ref& row) {
     }
 
     metadata.erasure = ErasureSpec::deserialize(erasure_bytes);
+
+    const pqxx::bytes encrypted_dek_blob = row["encrypted_dek"].as<pqxx::bytes>();
+
+    metadata.encrypted_dek.reserve(encrypted_dek_blob.size());
+    for (const std::byte byte : encrypted_dek_blob) {
+        metadata.encrypted_dek.push_back(static_cast<std::uint8_t>(byte));
+    }
+
+    metadata.kek_id = row["kek_id"].c_str();
 
     return metadata;
 }

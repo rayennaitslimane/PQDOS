@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <httplib.h>
 #include <pqxx/pqxx>
 
 #include "StorageClient.hpp"
@@ -6,26 +7,17 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
-#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
 
-namespace fs = std::filesystem;
-
 namespace {
-
-constexpr const char* kTestRoot = "./data";
-constexpr const char* kNode1Path = "./data/node1";
-constexpr const char* kNode2Path = "./data/node2";
-constexpr const char* kNode3Path = "./data/node3";
 
 std::string testConnectionString() {
     if (const char* env = std::getenv("METADATASTORE_TEST_CONN")) {
         return std::string{env};
     }
 
-    // Matches docker-compose / MetadataStore tests
     return "host=localhost "
            "port=5433 "
            "dbname=pqdos_test "
@@ -39,14 +31,6 @@ Bytes ToBytes(const std::string& s) {
 
 std::string ToString(const Bytes& bytes) {
     return std::string(bytes.begin(), bytes.end());
-}
-
-void ResetTestStorage() {
-    std::error_code ec;
-    fs::remove_all(kTestRoot, ec);
-    fs::create_directories(kNode1Path, ec);
-    fs::create_directories(kNode2Path, ec);
-    fs::create_directories(kNode3Path, ec);
 }
 
 bool ContainsObjectId(
@@ -73,7 +57,6 @@ protected:
     void SetUp() override {
         connStr_ = testConnectionString();
 
-        ResetTestStorage();
         clearDatabase();
 
         client_ = std::make_unique<StorageClient>(connStr_);
@@ -82,11 +65,7 @@ protected:
 
     void TearDown() override {
         client_.reset();
-
         clearDatabase();
-
-        std::error_code ec;
-        fs::remove_all(kTestRoot, ec);
     }
 
     void clearDatabase() {
@@ -151,25 +130,6 @@ TEST_F(StorageClientTest, ListTest) {
     EXPECT_TRUE(ContainsObjectId(items, id1));
     EXPECT_TRUE(ContainsObjectId(items, id2));
     EXPECT_TRUE(ContainsObjectId(items, id3));
-}
-
-TEST_F(StorageClientTest, RemoveSecondNodeFromFilesystemThenGetTest) {
-    const std::string object_id = "00000000-0000-0000-0000-000000000106";
-    const std::string original = "node2 deleted but data still recovers";
-
-    client().put(object_id, ToBytes(original));
-
-    std::error_code ec;
-    fs::remove_all(kNode2Path, ec);
-    ASSERT_FALSE(ec) << "Failed to remove second node path: " << ec.message();
-
-    // Re-create the directory as empty so the underlying storage node can still access the path,
-    // but the shard that used to live there is gone.
-    fs::create_directories(kNode2Path, ec);
-    ASSERT_FALSE(ec) << "Failed to recreate second node path: " << ec.message();
-
-    const Bytes restored = client().get(object_id);
-    EXPECT_EQ(ToString(restored), original);
 }
 
 TEST_F(StorageClientTest, DeleteTest) {

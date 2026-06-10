@@ -46,6 +46,8 @@ struct ObjectMetadata {
     std::string checksum;
     ErasureSpec erasure;
     std::vector<std::string> shard_locations;
+    Bytes encrypted_dek;
+    std::string kek_id;
 };
 
 struct PlainShard {

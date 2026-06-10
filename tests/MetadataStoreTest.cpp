@@ -44,6 +44,8 @@ ObjectMetadata makeMetadata(
     metadata.checksum = std::move(checksum);
     metadata.erasure = makeErasureSpec();
     metadata.shard_locations = std::move(shardLocations);
+    metadata.encrypted_dek = Bytes{0xDE, 0xAD, 0xBE, 0xEF};
+    metadata.kek_id = "test-kek-id";
     return metadata;
 }
 
@@ -55,6 +57,8 @@ void expectMetadataEqual(
     EXPECT_EQ(expected.size, actual.size);
     EXPECT_EQ(expected.checksum, actual.checksum);
     EXPECT_EQ(expected.shard_locations, actual.shard_locations);
+    EXPECT_EQ(expected.encrypted_dek, actual.encrypted_dek);
+    EXPECT_EQ(expected.kek_id, actual.kek_id);
 
     // Avoid requiring operator== on ErasureSpec.
     EXPECT_EQ(expected.erasure.serialize(), actual.erasure.serialize());
