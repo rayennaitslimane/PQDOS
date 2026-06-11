@@ -10,12 +10,14 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <iomanip>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <future>
 #include <utility>
 #include <vector>
 #include <algorithm>
@@ -53,8 +55,56 @@ std::array<std::string, kNumNodes> parseNodeAddresses() {
 
 const std::array<std::string, kNumNodes> kNodeAddresses = parseNodeAddresses();
 
-// Demo / MVP KEK (ML-KEM-768 keypair generated at construction)
-const std::string kKEKId = "kek-001";
+const std::string kDefaultKekFilePath = "/tmp/pqdos_test_kek.json";
+
+std::string parseKekFilePath() {
+    const char* env = std::getenv("PQDOS_KEYSTORE_PATH");
+    if (env) {
+        return env;
+    }
+    return kDefaultKekFilePath;
+}
+
+std::string generateKekId() {
+    Botan::AutoSeeded_RNG rng;
+    std::array<uint8_t, 16> bytes{};
+    rng.randomize(bytes.data(), bytes.size());
+
+    // RFC4122 UUIDv4: set version and variant bits.
+    bytes[6] = static_cast<uint8_t>((bytes[6] & 0x0F) | 0x40);
+    bytes[8] = static_cast<uint8_t>((bytes[8] & 0x3F) | 0x80);
+
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string uuid;
+    uuid.reserve(36);
+
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) {
+            uuid.push_back('-');
+        }
+        uuid.push_back(kHex[(bytes[i] >> 4) & 0x0F]);
+        uuid.push_back(kHex[bytes[i] & 0x0F]);
+    }
+
+    return uuid;
+}
+
+std::string generateVersion() {
+    Botan::AutoSeeded_RNG rng;
+    std::array<uint8_t, 8> bytes{};
+    rng.randomize(bytes.data(), bytes.size());
+
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string version;
+    version.reserve(16);
+
+    for (uint8_t b : bytes) {
+        version.push_back(kHex[(b >> 4) & 0x0F]);
+        version.push_back(kHex[b & 0x0F]);
+    }
+
+    return version;
+}
 
 // =========================
 // Internal types
@@ -88,8 +138,8 @@ std::string bytes_to_hex(const Bytes& bytes) {
     return oss.str();
 }
 
-std::string make_shard_location(const std::string& object_id, uint32_t shard_index) {
-    return object_id + "-" + std::to_string(shard_index);
+std::string make_shard_location(const std::string& object_id, const std::string& version, uint32_t shard_index) {
+    return object_id + "-" + version + "-" + std::to_string(shard_index);
 }
 
 ErasureSpec make_erasure_spec() {
@@ -114,6 +164,7 @@ std::pair<std::string, int> parse_address(const std::string& address) {
 // - shard i goes to node i
 PlacementMap placement_strategy(
     const std::string& object_id,
+    const std::string& version,
     const std::vector<Bytes>& serialized_shards
 ) {
     const std::size_t total_shards = serialized_shards.size();
@@ -130,6 +181,7 @@ PlacementMap placement_strategy(
         const std::string& node_address = kNodeAddresses[i];
         const std::string location = make_shard_location(
             object_id,
+            version,
             static_cast<uint32_t>(i)
         );
 
@@ -140,25 +192,35 @@ PlacementMap placement_strategy(
 }
 
 void apply_placement(const PlacementMap& placement) {
+    std::vector<std::future<void>> futures;
+
     for (const auto& [node_address, entries] : placement) {
-        auto [host, port] = parse_address(node_address);
-        httplib::Client client(host, port);
+        futures.push_back(std::async(std::launch::async,
+            [&node_address, &entries]() {
+                auto [host, port] = parse_address(node_address);
+                httplib::Client client(host, port);
 
-        for (const auto& [location, payload] : entries) {
-            auto res = client.Put(
-                "/shards/" + location,
-                reinterpret_cast<const char*>(payload.data()),
-                payload.size(),
-                "application/octet-stream"
-            );
+                for (const auto& [location, payload] : entries) {
+                    auto res = client.Put(
+                        "/shards/" + location,
+                        reinterpret_cast<const char*>(payload.data()),
+                        payload.size(),
+                        "application/octet-stream"
+                    );
 
-            if (!res || res->status != 200) {
-                throw std::runtime_error(
-                    "apply_placement: failed to PUT shard to " +
-                    node_address + "/shards/" + location
-                );
+                    if (!res || res->status != 200) {
+                        throw std::runtime_error(
+                            "apply_placement: failed to PUT shard to " +
+                            node_address + "/shards/" + location
+                        );
+                    }
+                }
             }
-        }
+        ));
+    }
+
+    for (auto& f : futures) {
+        f.get();
     }
 }
 
@@ -208,66 +270,96 @@ ShardLocationMap parse_shard_locations(const std::vector<std::string>& shard_loc
 std::vector<EncryptedShard> fetch_encrypted_shards(
     const ShardLocationMap& shard_location_map
 ) {
-    std::vector<EncryptedShard> encrypted_shards;
+    std::vector<std::future<std::vector<EncryptedShard>>> futures;
 
     for (const auto& [node_address, locations] : shard_location_map) {
-        std::pair<std::string, int> addr;
+        futures.push_back(std::async(std::launch::async,
+            [&node_address, &locations]() -> std::vector<EncryptedShard> {
+                std::vector<EncryptedShard> shards;
 
-        try {
-            addr = parse_address(node_address);
-        } catch (...) {
-            continue;
-        }
-
-        httplib::Client client(addr.first, addr.second);
-
-        for (const auto& location : locations) {
-            try {
-                auto res = client.Get("/shards/" + location);
-
-                if (!res || res->status != 200) {
-                    continue; // missing shard
-                }
-
-                Bytes payload(res->body.begin(), res->body.end());
-
+                std::pair<std::string, int> addr;
                 try {
-                    encrypted_shards.push_back(
-                        EncryptedShard::deserialize(payload)
-                    );
+                    addr = parse_address(node_address);
                 } catch (...) {
-                    // malformed/corrupt serialized shard -> ignore
-                    continue;
+                    return shards;
                 }
-            } catch (...) {
-                // node unavailable
-                continue;
+
+                httplib::Client client(addr.first, addr.second);
+
+                for (const auto& location : locations) {
+                    try {
+                        auto res = client.Get("/shards/" + location);
+
+                        if (!res || res->status != 200) {
+                            continue; // missing shard
+                        }
+
+                        Bytes payload(res->body.begin(), res->body.end());
+
+                        try {
+                            shards.push_back(
+                                EncryptedShard::deserialize(payload)
+                            );
+                        } catch (...) {
+                            // malformed/corrupt serialized shard -> ignore
+                            continue;
+                        }
+                    } catch (...) {
+                        // node unavailable
+                        continue;
+                    }
+                }
+
+                return shards;
             }
-        }
+        ));
+    }
+
+    std::vector<EncryptedShard> encrypted_shards;
+    for (auto& f : futures) {
+        auto shards = f.get();
+        encrypted_shards.insert(
+            encrypted_shards.end(),
+            std::make_move_iterator(shards.begin()),
+            std::make_move_iterator(shards.end())
+        );
     }
 
     return encrypted_shards;
 }
 
 void remove_from_nodes(const ShardLocationMap& shard_location_map) {
+    std::vector<std::future<void>> futures;
+
     for (const auto& [node_address, locations] : shard_location_map) {
-        std::pair<std::string, int> addr;
+        futures.push_back(std::async(std::launch::async,
+            [&node_address, &locations]() {
+                std::pair<std::string, int> addr;
+                try {
+                    addr = parse_address(node_address);
+                } catch (...) {
+                    return;
+                }
 
-        try {
-            addr = parse_address(node_address);
-        } catch (...) {
-            continue;
-        }
+                httplib::Client client(addr.first, addr.second);
 
-        httplib::Client client(addr.first, addr.second);
-
-        for (const auto& location : locations) {
-            try {
-                (void)client.Delete("/shards/" + location);
-            } catch (...) {
-                // Ignore missing node / already-deleted shard / backend failure
-                continue;
+                for (const auto& location : locations) {
+                    try {
+                        (void)client.Delete("/shards/" + location);
+                    } catch (...) {
+                        // Ignore missing node / already-deleted shard / backend failure
+                        continue;
+                    }
+                }
             }
+        ));
+    }
+
+    for (auto& f : futures) {
+        try {
+            f.get();
+        } catch (...) {
+            // best-effort deletion
         }
     }
 }
@@ -279,11 +371,29 @@ void remove_from_nodes(const ShardLocationMap& shard_location_map) {
 // =========================
 
 StorageClient::StorageClient(const std::string& metadata_conn_str)
-    : metadata_store_(metadata_conn_str), kek_id_(kKEKId) {
-    Botan::AutoSeeded_RNG rng;
-    kek_ = Botan::create_private_key("ML-KEM", rng, "ML-KEM-768");
-    if (!kek_) {
-        throw std::runtime_error("StorageClient: failed to create ML-KEM-768 key");
+    : metadata_store_(metadata_conn_str),
+      kek_file_path_(parseKekFilePath()) {
+    if (std::filesystem::exists(kek_file_path_)) {
+        auto data = load_kek_file(kek_file_path_);
+        kek_ring_ = std::move(data.keys);
+        active_kek_id_ = std::move(data.active_kek_id);
+    } else {
+        Botan::AutoSeeded_RNG rng;
+        auto key = Botan::create_private_key("ML-KEM", rng, "ML-KEM-768");
+        if (!key) {
+            throw std::runtime_error("StorageClient: failed to create ML-KEM-768 key");
+        }
+
+        do {
+            active_kek_id_ = generateKekId();
+        } while (kek_ring_.count(active_kek_id_) != 0);
+
+        const auto inserted = kek_ring_.emplace(active_kek_id_, std::move(key));
+        if (!inserted.second) {
+            throw std::runtime_error("StorageClient: failed to insert initial KEK");
+        }
+
+        save_kek_file(kek_file_path_, kek_ring_, active_kek_id_);
     }
 }
 
@@ -347,7 +457,7 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes) {
         );
     }
 
-    Bytes wrapped_dek = encrypt_dek(dek, *kek_->public_key());
+    Bytes wrapped_dek = encrypt_dek(dek, *kek_ring_.at(active_kek_id_)->public_key());
     Botan::secure_scrub_memory(dek.data(), dek.size());
 
     std::vector<Bytes> serialized_shards;
@@ -358,7 +468,8 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes) {
     }
 
     // 5) placement_strategy(serialized_shards)
-    PlacementMap placement = placement_strategy(object_id, serialized_shards);
+    const std::string version = generateVersion();
+    PlacementMap placement = placement_strategy(object_id, version, serialized_shards);
 
     // 6) apply_placement(map) over HTTP
     apply_placement(placement);
@@ -371,7 +482,7 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes) {
     metadata.erasure = erasure_spec;
     metadata.shard_locations = build_shard_locations(placement);
     metadata.encrypted_dek = wrapped_dek;
-    metadata.kek_id = kek_id_;
+    metadata.kek_id = active_kek_id_;
 
     metadata_store_.put(metadata);
 }
@@ -404,8 +515,41 @@ Bytes StorageClient::get(const std::string& object_id) {
         );
     }
 
-    // 4) Decrypt DEK and decrypt shards
-    std::array<uint8_t, 32> dek = decrypt_dek(metadata.encrypted_dek, *kek_);
+    // 4) Decrypt DEK — try matching kek_id first, then fallback to all
+    std::array<uint8_t, 32> dek{};
+    bool dek_recovered = false;
+
+    auto try_decrypt = [&](const Botan::Private_Key& key) -> bool {
+        try {
+            dek = decrypt_dek(metadata.encrypted_dek, key);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    // Try the key indicated by metadata first
+    auto it = kek_ring_.find(metadata.kek_id);
+    if (it != kek_ring_.end()) {
+        dek_recovered = try_decrypt(*it->second);
+    }
+
+    // Fallback: try remaining keys
+    if (!dek_recovered) {
+        for (const auto& [id, key] : kek_ring_) {
+            if (id == metadata.kek_id) continue;
+            if (try_decrypt(*key)) {
+                dek_recovered = true;
+                break;
+            }
+        }
+    }
+
+    if (!dek_recovered) {
+        throw std::runtime_error(
+            "StorageClient::get: cannot decrypt DEK with any available KEK"
+        );
+    }
 
     const std::vector<PlainShard> plain_shards =
         decrypt_shards(encrypted_shards, dek);
@@ -457,4 +601,23 @@ bool StorageClient::remove(const std::string& object_id) {
 
 std::vector<ObjectMetadata> StorageClient::list() {
     return metadata_store_.list();
+}
+
+void StorageClient::rotate() {
+    Botan::AutoSeeded_RNG rng;
+    auto key = Botan::create_private_key("ML-KEM", rng, "ML-KEM-768");
+    if (!key) {
+        throw std::runtime_error("StorageClient::rotate: failed to create ML-KEM-768 key");
+    }
+
+    do {
+        active_kek_id_ = generateKekId();
+    } while (kek_ring_.count(active_kek_id_) != 0);
+
+    const auto inserted = kek_ring_.emplace(active_kek_id_, std::move(key));
+    if (!inserted.second) {
+        throw std::runtime_error("StorageClient::rotate: generated duplicate KEK ID");
+    }
+
+    save_kek_file(kek_file_path_, kek_ring_, active_kek_id_);
 }

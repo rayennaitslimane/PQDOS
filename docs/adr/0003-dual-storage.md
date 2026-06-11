@@ -1,0 +1,92 @@
+# ADR-0003: Dual Storage
+
+**Status:** Accepted  
+**Date:** 2026-06-11
+
+## Context
+
+The system manages two fundamentally different categories of data:
+
+1. **Shard payloads** — opaque binary blobs (encrypted shard ciphertext + nonce), written and read by key, with no relational structure, high write throughput requirements, and a need for crash-safe atomic multi-shard transactions.
+2. **Object metadata** — structured records (object ID, size, checksum, erasure parameters, shard location strings, wrapped DEK, KEK ID) that must be queryable, must support cascading deletes, and form the authoritative index for reconstructing any object.
+
+Using a single storage technology for both categories would either force a relational database to handle large binary blobs inefficiently or force a key-value store to implement relational integrity manually.
+
+## Decision
+
+### Shard payloads: LMDB (`lmdb::lmdb`)
+
+Each `StorageNode` embeds one **Lightning Memory-Mapped Database (LMDB)** environment opened at a configurable filesystem path. LMDB provides:
+
+- **ACID transactions** — all shards in a single `put()` call are committed atomically in one `mdb_txn_commit`. If the process dies mid-write no partial batch is left on disk.
+- **Memory-mapped reads** — `mdb_get` on a read transaction returns a pointer directly into the mmap region; no copy is made until `bytes_from_mdb_value` copies the bytes into a `std::vector`. This is the fastest possible read path for a key-value store.
+- **Single-writer, multiple-reader** — appropriate for each node process which has one writer (the HTTP handler thread for PUT/DELETE) and potentially concurrent readers (GET handlers). The 1 GB map size is set at open time; no data is pre-allocated.
+
+The environment is opened once in `StorageNode::StorageNode()` and closed in the destructor via RAII. Copy and move constructors are deleted; there is exactly one `StorageNode` per process.
+
+Transactions in `get()` are opened with `MDB_RDONLY` and ended with `mdb_txn_abort` (releasing the read lock), never `mdb_txn_commit`, which is correct per LMDB semantics for read-only transactions.
+
+### Object metadata: PostgreSQL via libpqxx
+
+`MetadataStore` holds a single persistent `pqxx::connection` to a PostgreSQL database. The schema is:
+
+```sql
+object_metadata (
+    id UUID PRIMARY KEY,
+    size BIGINT NOT NULL CHECK (size >= 0),
+    checksum TEXT NOT NULL,
+    erasure_spec BYTEA NOT NULL,
+    encrypted_dek BYTEA NOT NULL,
+    kek_id TEXT NOT NULL
+)
+
+object_shard_locations (
+    object_id UUID NOT NULL REFERENCES object_metadata(id) ON DELETE CASCADE,
+    shard_index INTEGER NOT NULL CHECK (shard_index >= 0),
+    location TEXT NOT NULL,
+    PRIMARY KEY (object_id, shard_index)
+)
+```
+
+Key design points:
+- `ON DELETE CASCADE` ensures that deleting a row from `object_metadata` atomically removes all associated shard location rows — no orphaned location records.
+- An index on `object_shard_locations(object_id)` accelerates per-object shard location lookups.
+- All six queries (`put_object_metadata`, `delete_object_shard_locations`, `insert_object_shard_location`, `get_object_metadata`, `remove_object_metadata`, `list_object_metadata`) are registered as **prepared statements** at construction time via `conn_.prepare(...)`. This both eliminates SQL injection risk and avoids repeated query planning overhead.
+- `put()` uses `ON CONFLICT (id) DO UPDATE` (upsert) so re-uploading an object with the same ID is a safe idempotent operation.
+
+### Shard location encoding
+
+Shard locations are stored as strings of the form `"host:port/object_id-version-shard_index"`, where `version` is a per-`put` random token. The `StorageClient` parses these strings to determine which node to contact and which key to request.
+
+Using a versioned keyspace ensures concurrent writes to the same `object_id` do not overwrite each other's shard payloads in LMDB. Only after all versioned shard writes complete successfully is metadata upserted to reference that exact version.
+
+This approach avoids a third table but means the storage topology is embedded in every metadata row — changing node addresses requires updating all location strings.
+
+### Known gap: N+1 query in `list()`
+
+`MetadataStore::list()` issues one SQL query to fetch all object rows and then calls `get_shard_locations()` — a second query — for each object:
+
+```cpp
+for (const auto& row : rows) {
+    ObjectMetadata metadata = row_to_object_metadata(row);
+    metadata.shard_locations = get_shard_locations(tx, metadata.id); // N additional queries
+}
+```
+
+For a collection of N objects this produces N+1 total round-trips to PostgreSQL. The correct fix is a single JOIN query that fetches both tables in one round-trip, assembling the shard location vectors client-side. This is deferred as a known POC limitation.
+
+## Consequences
+
+**Positive:**
+- LMDB's memory-mapped design gives near-zero-copy shard reads; no intermediate buffer allocation in the storage layer.
+- LMDB's single-file, single-process model is operationally simple — no daemon, no network, no separate configuration.
+- PostgreSQL provides referential integrity, cascading deletes, and a rich query interface for metadata without any manual bookkeeping.
+- Prepared statements prevent SQL injection and reduce per-query planning cost.
+- The two stores are independently scalable: metadata can be moved to a managed PostgreSQL service without touching shard storage, and vice versa.
+
+**Negative / Risks:**
+- `MetadataStore` holds a single `pqxx::connection`. This connection is not thread-safe (libpqxx connections are not). Concurrent HTTP handler threads calling `get`/`put`/`list` through the same `StorageClient` instance will race on the connection (see ADR-0005).
+- The N+1 query in `list()` degrades linearly with the number of stored objects and will become unacceptably slow at scale.
+- Shard location strings encode the storage topology. Node address changes require a migration of all location strings in PostgreSQL.
+- Versioned shard keys can leave orphaned shard payloads for losing concurrent writers. This is a storage-leak trade-off that preserves read correctness.
+- The `erasure_spec` field is stored as `BYTEA` (msgpack blob) rather than as structured columns, making it opaque to SQL queries and migrations.

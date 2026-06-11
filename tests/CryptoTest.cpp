@@ -5,10 +5,13 @@
 
 #include <botan/auto_rng.h>
 #include <botan/pk_algs.h>
+#include <botan/pkcs8.h>
 #include <botan/pubkey.h>
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -482,4 +485,104 @@ TEST(CryptoTest, DecryptSucceedsWithOutOfOrderShards) {
     for (const auto& d : decrypted) {
         EXPECT_EQ(d.bytes, original_shards[d.index].bytes);
     }
+}
+
+// =========================
+// KEK File Persistence
+// =========================
+
+TEST(CryptoTest, SaveAndLoadKekFileRoundTrip) {
+    namespace fs = std::filesystem;
+    const std::string path = "/tmp/pqdos_test_kek_roundtrip.json";
+
+    // Cleanup
+    fs::remove(path);
+
+    Botan::AutoSeeded_RNG rng;
+    std::unordered_map<std::string, std::unique_ptr<Botan::Private_Key>> keys;
+    auto k1 = Botan::create_private_key("ML-KEM", rng, "ML-KEM-768");
+    auto k2 = Botan::create_private_key("ML-KEM", rng, "ML-KEM-768");
+
+    std::string pem1 = Botan::PKCS8::PEM_encode(*k1);
+    std::string pem2 = Botan::PKCS8::PEM_encode(*k2);
+
+    keys.emplace("kek-100", std::move(k1));
+    keys.emplace("kek-200", std::move(k2));
+
+    save_kek_file(path, keys, "kek-200");
+
+    KekFileData loaded = load_kek_file(path);
+
+    EXPECT_EQ(loaded.active_kek_id, "kek-200");
+    EXPECT_EQ(loaded.keys.size(), 2u);
+    EXPECT_TRUE(loaded.keys.count("kek-100"));
+    EXPECT_TRUE(loaded.keys.count("kek-200"));
+
+    // Verify PEM content matches
+    EXPECT_EQ(Botan::PKCS8::PEM_encode(*loaded.keys.at("kek-100")), pem1);
+    EXPECT_EQ(Botan::PKCS8::PEM_encode(*loaded.keys.at("kek-200")), pem2);
+
+    fs::remove(path);
+}
+
+TEST(CryptoTest, SaveKekFileSetsPermissions0600) {
+    namespace fs = std::filesystem;
+    const std::string path = "/tmp/pqdos_test_kek_perms.json";
+
+    fs::remove(path);
+
+    Botan::AutoSeeded_RNG rng;
+    std::unordered_map<std::string, std::unique_ptr<Botan::Private_Key>> keys;
+    keys.emplace("kek-1", Botan::create_private_key("ML-KEM", rng, "ML-KEM-768"));
+
+    save_kek_file(path, keys, "kek-1");
+
+    auto perms = fs::status(path).permissions();
+    EXPECT_EQ(perms, (fs::perms::owner_read | fs::perms::owner_write));
+
+    fs::remove(path);
+}
+
+TEST(CryptoTest, LoadKekFileThrowsOnCorruptJson) {
+    const std::string path = "/tmp/pqdos_test_kek_corrupt.json";
+
+    std::ofstream f(path);
+    f << "not valid json {{{{";
+    f.close();
+
+    EXPECT_THROW(load_kek_file(path), std::runtime_error);
+
+    std::filesystem::remove(path);
+}
+
+TEST(CryptoTest, LoadKekFileThrowsOnMissingFile) {
+    EXPECT_THROW(load_kek_file("/tmp/pqdos_nonexistent_kek.json"), std::runtime_error);
+}
+
+TEST(CryptoTest, LoadedKeyCanDecryptDekFromOriginal) {
+    namespace fs = std::filesystem;
+    const std::string path = "/tmp/pqdos_test_kek_decrypt.json";
+
+    fs::remove(path);
+
+    Botan::AutoSeeded_RNG rng;
+    auto original_key = Botan::create_private_key("ML-KEM", rng, "ML-KEM-768");
+
+    // Encrypt a DEK with the original key
+    std::array<uint8_t, 32> dek;
+    rng.randomize(dek.data(), dek.size());
+    Bytes wrapped = encrypt_dek(dek, *original_key->public_key());
+
+    // Save and reload
+    std::unordered_map<std::string, std::unique_ptr<Botan::Private_Key>> keys;
+    keys.emplace("kek-orig", std::move(original_key));
+    save_kek_file(path, keys, "kek-orig");
+
+    KekFileData loaded = load_kek_file(path);
+
+    // Decrypt with loaded key
+    auto recovered = decrypt_dek(wrapped, *loaded.keys.at("kek-orig"));
+    EXPECT_EQ(recovered, dek);
+
+    fs::remove(path);
 }

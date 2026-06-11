@@ -15,6 +15,7 @@ find_package(lmdb REQUIRED)
 find_package(msgpack REQUIRED)
 find_package(httplib REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(pqdos
     core/ErasureCodec.cpp
@@ -38,6 +39,7 @@ target_link_libraries(pqdos PUBLIC
     msgpack-cxx
     httplib::httplib
     nlohmann_json::nlohmann_json
+    Threads::Threads
 )
 
 if(BUILD_TESTING)

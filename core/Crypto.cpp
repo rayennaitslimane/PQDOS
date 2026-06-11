@@ -6,12 +6,118 @@
 #include <botan/auto_rng.h>
 #include <botan/exceptn.h>
 #include <botan/mem_ops.h>
+#include <botan/pk_algs.h>
+#include <botan/pkcs8.h>
+#include <botan/data_src.h>
 #include <botan/pubkey.h>
+#include <nlohmann/json.hpp>
 
 #include <vector>
 #include <array>
 #include <stdexcept>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+// =========================
+// KEK File Persistence
+// =========================
+
+void save_kek_file(
+    const std::string& path,
+    const std::unordered_map<std::string, std::unique_ptr<Botan::Private_Key>>& keys,
+    const std::string& active_id
+) {
+    namespace fs = std::filesystem;
+
+    // Ensure parent directory exists with 0700
+    fs::path file_path(path);
+    fs::path parent = file_path.parent_path();
+    if (!parent.empty() && !fs::exists(parent)) {
+        fs::create_directories(parent);
+        fs::permissions(parent,
+            fs::perms::owner_all,
+            fs::perm_options::replace);
+    }
+
+    // Build JSON
+    nlohmann::json j;
+    j["version"] = 1;
+    j["active_kek_id"] = active_id;
+
+    nlohmann::json keys_array = nlohmann::json::array();
+    for (const auto& [id, key] : keys) {
+        nlohmann::json entry;
+        entry["id"] = id;
+        entry["pem"] = Botan::PKCS8::PEM_encode(*key);
+        keys_array.push_back(std::move(entry));
+    }
+    j["keys"] = std::move(keys_array);
+
+    // Write file
+    std::ofstream file(path, std::ios::out | std::ios::trunc);
+    if (!file.is_open()) {
+        throw std::runtime_error("save_kek_file: cannot open file: " + path);
+    }
+    file << j.dump(2);
+    file.close();
+
+    // Set file permissions to 0600 immediately
+    fs::permissions(file_path,
+        fs::perms::owner_read | fs::perms::owner_write,
+        fs::perm_options::replace);
+}
+
+KekFileData load_kek_file(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        throw std::runtime_error("load_kek_file: cannot open file: " + path);
+    }
+
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(file);
+    } catch (const nlohmann::json::parse_error& e) {
+        throw std::runtime_error(
+            std::string("load_kek_file: invalid JSON: ") + e.what()
+        );
+    }
+
+    if (!j.contains("version") || j["version"] != 1) {
+        throw std::runtime_error("load_kek_file: unsupported version");
+    }
+
+    if (!j.contains("active_kek_id") || !j.contains("keys")) {
+        throw std::runtime_error("load_kek_file: missing required fields");
+    }
+
+    KekFileData data;
+    data.active_kek_id = j["active_kek_id"].get<std::string>();
+
+    Botan::AutoSeeded_RNG rng;
+    for (const auto& entry : j["keys"]) {
+        std::string id = entry["id"].get<std::string>();
+        std::string pem = entry["pem"].get<std::string>();
+
+        Botan::DataSource_Memory src(pem);
+        auto key = Botan::PKCS8::load_key(src);
+        if (!key) {
+            throw std::runtime_error(
+                "load_kek_file: failed to load key: " + id
+            );
+        }
+        data.keys.emplace(std::move(id), std::move(key));
+    }
+
+    if (data.keys.find(data.active_kek_id) == data.keys.end()) {
+        throw std::runtime_error(
+            "load_kek_file: active_kek_id not found in keys"
+        );
+    }
+
+    return data;
+}
 
 // Checksum generated and validated before erasure encoding takes place
 Bytes checksum_sha256(const Bytes& bytes) {

@@ -2,11 +2,27 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Botan { class Public_Key; class Private_Key; }
 
 Bytes checksum_sha256(const Bytes& bytes);
+
+void save_kek_file(
+    const std::string& path,
+    const std::unordered_map<std::string, std::unique_ptr<Botan::Private_Key>>& keys,
+    const std::string& active_id
+);
+
+struct KekFileData {
+    std::unordered_map<std::string, std::unique_ptr<Botan::Private_Key>> keys;
+    std::string active_kek_id;
+};
+
+KekFileData load_kek_file(const std::string& path);
 
 std::vector<EncryptedShard> encrypt_shards(
     const std::vector<PlainShard>& shards,

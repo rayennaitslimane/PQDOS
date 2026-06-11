@@ -16,9 +16,14 @@ A zero-trust distributed object storage system featuring post-quantum cryptograp
 ## Building
 
 ```bash
-conan install . --build=missing -s build_type=Release -s compiler.cppstd=20
-cmake --preset conan-release
-cmake --build --preset conan-release
+# Build for the first time
+./scripts/build.sh
+
+# Clean build
+./scripts/build.sh clean
+
+# Remove all build files
+./scripts/build.sh reset
 ```
 
 ## Testing
@@ -88,6 +93,18 @@ curl http://localhost:8080/objects
 # [{"id":"my-file","size":11,"checksum":"b94d27b9..."}]
 ```
 
+## Architecture Overview
+
+Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
+
+| ADR | Decision |
+|-----|----------|
+| [0001](docs/adr/0001-quantum-encryption.md) | ML-KEM-768 KEK + AES-256-GCM per-object DEK with shard-index AAD |
+| [0002](docs/adr/0002-erasure-codec.md) | ISA-L Reed-Solomon 2+1 erasure coding |
+| [0003](docs/adr/0003-dual-storage.md) | LMDB for shard payloads, PostgreSQL for object metadata |
+| [0004](docs/adr/0004-shard-transport.md) | Parallel HTTP shard dispatch using std::async with index-based placement |
+| [0005](docs/adr/0005-http-surface.md) | cpp-httplib embedded HTTP server for client and node APIs |
+
 ## Storage Node API
 
 Used internally by the client. Each node exposes:
@@ -98,3 +115,4 @@ Used internally by the client. Each node exposes:
 | PUT | `/shards/:location` | raw bytes | Store a shard |
 | GET | `/shards/:location` | - | Retrieve a shard |
 | DELETE | `/shards/:location` | - | Delete a shard |
+

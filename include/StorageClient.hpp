@@ -8,6 +8,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 class StorageClient {
 public:
@@ -19,6 +20,7 @@ public:
     Bytes get(const std::string& object_id);
     bool remove(const std::string& object_id);
     std::vector<ObjectMetadata> list();
+    void rotate();
 
     StorageClient(const StorageClient&) = delete;
     StorageClient& operator=(const StorageClient&) = delete;
@@ -28,6 +30,7 @@ public:
 
 private:
     MetadataStore metadata_store_;
-    std::unique_ptr<Botan::Private_Key> kek_;
-    std::string kek_id_;
+    std::unordered_map<std::string, std::unique_ptr<Botan::Private_Key>> kek_ring_;
+    std::string active_kek_id_;
+    std::string kek_file_path_;
 };

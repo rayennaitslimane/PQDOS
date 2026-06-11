@@ -15,15 +15,6 @@ echo "Postgres is ready."
 
 echo "Starting storage nodes..."
 
-# Single confirmation prompt
-read -r -p "Reset storage node data? (y/N): " answer
-if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
-  echo "Resetting storage node data..."
-  rm -rf /tmp/node1-data /tmp/node2-data /tmp/node3-data
-else
-  echo "Keeping existing storage node data."
-fi
-
 mkdir -p /tmp/node1-data /tmp/node2-data /tmp/node3-data
 
 "$PROJECT_DIR/build/Release/storage_node" 0.0.0.0 9001 /tmp/node1-data &
