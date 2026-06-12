@@ -57,6 +57,14 @@ const ObjectMetadata* FindObjectMetadata(
     return it == items.end() ? nullptr : &(*it);
 }
 
+ErasureSpec TestErasureSpec() {
+    ErasureSpec spec;
+    spec.data_shards = 2;
+    spec.parity_shards = 1;
+    spec.shard_size = 20;
+    return spec;
+}
+
 class StorageClientTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -107,7 +115,7 @@ TEST_F(StorageClientTest, PutTest) {
     const std::string object_id = "00000000-0000-0000-0000-000000000101";
     const Bytes payload = ToBytes("Hello from put test");
 
-    ASSERT_NO_THROW(client().put(object_id, payload));
+    ASSERT_NO_THROW(client().put(object_id, payload, TestErasureSpec()));
 
     const auto items = client().list();
     ASSERT_TRUE(ContainsObjectId(items, object_id));
@@ -123,7 +131,7 @@ TEST_F(StorageClientTest, GetTest) {
     const std::string object_id = "00000000-0000-0000-0000-000000000102";
     const std::string original = "Hello from get test 1234567890";
 
-    client().put(object_id, ToBytes(original));
+    client().put(object_id, ToBytes(original), TestErasureSpec());
 
     const Bytes restored = client().get(object_id);
     EXPECT_EQ(ToString(restored), original);
@@ -134,9 +142,9 @@ TEST_F(StorageClientTest, ListTest) {
     const std::string id2 = "00000000-0000-0000-0000-000000000104";
     const std::string id3 = "00000000-0000-0000-0000-000000000105";
 
-    client().put(id1, ToBytes("payload-1"));
-    client().put(id2, ToBytes("payload-2"));
-    client().put(id3, ToBytes("payload-3"));
+    client().put(id1, ToBytes("payload-1"), TestErasureSpec());
+    client().put(id2, ToBytes("payload-2"), TestErasureSpec());
+    client().put(id3, ToBytes("payload-3"), TestErasureSpec());
 
     const auto items = client().list();
 
@@ -148,7 +156,7 @@ TEST_F(StorageClientTest, ListTest) {
 
 TEST_F(StorageClientTest, DeleteTest) {
     const std::string object_id = "00000000-0000-0000-0000-000000000107";
-    client().put(object_id, ToBytes("to-be-deleted"));
+    client().put(object_id, ToBytes("to-be-deleted"), TestErasureSpec());
 
     EXPECT_TRUE(client().remove(object_id));
     EXPECT_FALSE(client().remove(object_id));
@@ -173,13 +181,13 @@ TEST_F(StorageClientTest, RotationTest) {
     const std::string payload2 = "payload-after-rotation";
 
     // Write object with initial KEK
-    client().put(id1, ToBytes(payload1));
+    client().put(id1, ToBytes(payload1), TestErasureSpec());
 
     // Rotate KEK
     client().rotate();
 
     // Write object with new active KEK
-    client().put(id2, ToBytes(payload2));
+    client().put(id2, ToBytes(payload2), TestErasureSpec());
 
     // Destroy and recreate client (simulates restart, loads keyring from file)
     client_.reset();
@@ -200,12 +208,12 @@ TEST_F(StorageClientTest, RapidConsecutiveRotationsPreserveReadability) {
     const std::string payload2 = "payload-after-first-rotation";
     const std::string payload3 = "payload-after-second-rotation";
 
-    client().put(id1, ToBytes(payload1));
+    client().put(id1, ToBytes(payload1), TestErasureSpec());
     client().rotate();
-    client().put(id2, ToBytes(payload2));
+    client().put(id2, ToBytes(payload2), TestErasureSpec());
 
     client().rotate();
-    client().put(id3, ToBytes(payload3));
+    client().put(id3, ToBytes(payload3), TestErasureSpec());
 
     // Restart client and verify all generations remain readable.
     client_.reset();
@@ -268,7 +276,7 @@ TEST_F(StorageClientTest, ConcurrentWriteReadRoundTrip) {
     for (int i = 0; i < kNumClients; ++i) {
         threads.emplace_back([&, i]() {
             try {
-                env.clients[i]->put(ids[i], ToBytes(payloads[i]));
+                env.clients[i]->put(ids[i], ToBytes(payloads[i]), TestErasureSpec());
                 results[i] = env.clients[i]->get(ids[i]);
             } catch (...) {
                 any_failure.store(true);
@@ -292,7 +300,7 @@ TEST_F(StorageClientTest, GetSucceedsWithOneShardDeleted) {
     const std::string object_id = "00000000-0000-0000-0000-000000000410";
     const std::string original = "erasure-tolerance-test!";
 
-    client().put(object_id, ToBytes(original));
+    client().put(object_id, ToBytes(original), TestErasureSpec());
 
     // Look up the actual shard location for shard 0
     const auto items = client().list();
@@ -344,7 +352,7 @@ TEST_F(StorageClientTest, ConcurrentMaxSizePayloadFidelity) {
         for (int i = 0; i < kNumClients; ++i) {
             threads.emplace_back([&, i]() {
                 try {
-                    env.clients[i]->put(ids[i], payloads[i]);
+                    env.clients[i]->put(ids[i], payloads[i], TestErasureSpec());
                 } catch (...) {
                     write_fail.store(true);
                 }
@@ -418,7 +426,7 @@ TEST_F(StorageClientTest, HighVolumeWriteListConsistency) {
             threads.emplace_back([&, c]() {
                 try {
                     for (int o = 0; o < kObjectsPerClient; ++o) {
-                        env.clients[c]->put(ids[c][o], ToBytes(payloads[c][o]));
+                        env.clients[c]->put(ids[c][o], ToBytes(payloads[c][o]), TestErasureSpec());
                     }
                 } catch (...) {
                     write_fail.store(true);
@@ -471,7 +479,7 @@ TEST_F(StorageClientTest, GetCompletesWithMissingShardInBoundedTime) {
     const std::string object_id = "00000000-0000-0000-0000-000000000430";
     const std::string original = "timing-test-payload-abc";
 
-    client().put(object_id, ToBytes(original));
+    client().put(object_id, ToBytes(original), TestErasureSpec());
 
     // Look up the actual shard location for shard 2
     const auto items = client().list();
@@ -529,7 +537,7 @@ TEST_F(StorageClientTest, ConcurrentOverwriteSameObjectYieldsConsistentState) {
         for (int i = 0; i < kNumClients; ++i) {
             threads.emplace_back([&, i]() {
                 try {
-                    env.clients[i]->put(shared_id, ToBytes(candidate_payloads[i]));
+                    env.clients[i]->put(shared_id, ToBytes(candidate_payloads[i]), TestErasureSpec());
                 } catch (...) {
                     write_fail.store(true);
                 }
@@ -561,6 +569,206 @@ TEST_F(StorageClientTest, ConcurrentOverwriteSameObjectYieldsConsistentState) {
     int count = std::count_if(items.begin(), items.end(),
         [&](const ObjectMetadata& m) { return m.id == shared_id; });
     EXPECT_EQ(count, 1);
+}
+
+// ===========================================================================
+// Concurrency contract validation tests
+// ===========================================================================
+
+// Verifies that a single StorageClient instance can handle concurrent
+// put/get/remove/list operations from multiple threads without crashes or
+// data races (contract points 1 & 4).
+TEST_F(StorageClientTest, SameClientConcurrentAccess) {
+    constexpr int kNumThreads = 8;
+    constexpr int kOpsPerThread = 5;
+
+    std::vector<std::thread> threads;
+    std::atomic<int> errors{0};
+
+    for (int t = 0; t < kNumThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int i = 0; i < kOpsPerThread; ++i) {
+                // Each thread operates on its own object to avoid contention
+                // on the same UUID (per-object ordering is not guaranteed).
+                std::string id = "00000000-0000-0000-0000-0000000" +
+                    std::to_string(10000 + t * 100 + i);
+
+                std::string payload = "thread-" + std::to_string(t) +
+                    "-iter-" + std::to_string(i) + "-pad1234567890";
+
+                try {
+                    client().put(id, ToBytes(payload), TestErasureSpec());
+
+                    Bytes got = client().get(id);
+                    if (ToString(got) != payload) {
+                        ++errors;
+                    }
+
+                    client().list();
+
+                    client().remove(id);
+                } catch (const std::exception&) {
+                    ++errors;
+                }
+            }
+        });
+    }
+
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    EXPECT_EQ(errors.load(), 0)
+        << "Concurrent operations on distinct objects must not fail";
+}
+
+// Verifies that rotate() can execute concurrently with put()/get() without
+// causing data races or crashes (contract point 2: KEK ring coherence).
+TEST_F(StorageClientTest, ConcurrentRotateWithReadWrite) {
+    // Use valid UUIDs (36 chars total)
+    const std::string id1 = "00000000-0000-0000-0000-000000009001";
+    const std::string id2 = "00000000-0000-0000-0000-000000009002";
+
+    const std::string base_payload = "rotation-test-payload-pad";
+
+    // Seed objects
+    client().put(id1, ToBytes(base_payload + "1"), TestErasureSpec());
+    client().put(id2, ToBytes(base_payload + "2"), TestErasureSpec());
+
+    constexpr int kRotations = 5;
+    constexpr int kReadWriteOps = 10;
+
+    std::atomic<int> errors{0};
+
+    // Thread 1: repeatedly rotates the KEK
+    std::thread rotator([&]() {
+        for (int i = 0; i < kRotations; ++i) {
+            try {
+                client().rotate();
+            } catch (const std::exception&) {
+                ++errors;
+            }
+        }
+    });
+
+    // Thread 2: reads existing objects
+    std::thread reader([&]() {
+        for (int i = 0; i < kReadWriteOps; ++i) {
+            try {
+                Bytes got = client().get(id1);
+                if (ToString(got) != base_payload + "1") {
+                    ++errors;
+                }
+            } catch (const std::exception&) {
+                ++errors;
+            }
+        }
+    });
+
+    // Thread 3: writes new objects (with whichever KEK is active)
+    std::thread writer([&]() {
+        for (int i = 0; i < kReadWriteOps; ++i) {
+            // Ensure valid UUID suffix: always 12 digits
+            char buf[37];
+            snprintf(buf, sizeof(buf),
+                     "00000000-0000-0000-0000-%012d", 100 + i);
+            std::string id = buf;
+
+            try {
+                client().put(id, ToBytes("written-during-rotation-" + std::to_string(i)), TestErasureSpec());
+            } catch (const std::exception&) {
+                ++errors;
+            }
+        }
+    });
+
+    rotator.join();
+    reader.join();
+    writer.join();
+
+    EXPECT_EQ(errors.load(), 0)
+        << "Concurrent rotate with read/write must not crash or corrupt data";
+
+    // Objects written before rotation must still be readable after all rotations
+    EXPECT_EQ(ToString(client().get(id1)), base_payload + "1");
+    EXPECT_EQ(ToString(client().get(id2)), base_payload + "2");
+}
+
+// Designed to trigger ThreadSanitizer (TSAN) reports if run under
+// -fsanitize=thread. Exercises all code paths that touch shared mutable state
+// (pqxx::connection via MetadataStore, kek_ring_, active_kek_id_) from
+// multiple threads simultaneously.
+TEST_F(StorageClientTest, ThreadSanitizerCleanRun) {
+    constexpr int kThreads = 6;
+
+    // Pre-populate some objects
+    for (int i = 0; i < 3; ++i) {
+        std::string id = "00000000-0000-0000-0000-000000002" +
+            std::to_string(100 + i);
+        client().put(id, ToBytes("tsan-seed-" + std::to_string(i) + "-padding"), TestErasureSpec());
+    }
+
+    std::atomic<int> errors{0};
+    std::vector<std::thread> threads;
+
+    // Mix of all operation types running simultaneously
+    auto worker = [&](int tid) {
+        try {
+            switch (tid % 6) {
+                case 0: // put
+                {
+                    std::string id = "00000000-0000-0000-0000-000000003" +
+                        std::to_string(100 + tid);
+                    client().put(id, ToBytes("tsan-put-" + std::to_string(tid)), TestErasureSpec());
+                    break;
+                }
+                case 1: // get
+                {
+                    std::string id = "00000000-0000-0000-0000-000000002100";
+                    Bytes got = client().get(id);
+                    if (got.empty()) ++errors;
+                    break;
+                }
+                case 2: // list
+                    client().list();
+                    break;
+                case 3: // remove
+                {
+                    std::string id = "00000000-0000-0000-0000-000000002" +
+                        std::to_string(100 + (tid % 3));
+                    // May return false if already removed by another thread
+                    (void)client().remove(id);
+                    break;
+                }
+                case 4: // rotate
+                    client().rotate();
+                    break;
+                case 5: // put + get same object
+                {
+                    std::string id = "00000000-0000-0000-0000-000000004" +
+                        std::to_string(100 + tid);
+                    client().put(id, ToBytes("tsan-rw-" + std::to_string(tid)), TestErasureSpec());
+                    Bytes got = client().get(id);
+                    if (got.empty()) ++errors;
+                    break;
+                }
+            }
+        } catch (const std::exception&) {
+            // get() after remove() may throw "not found" — that's expected
+        }
+    };
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back(worker, i);
+    }
+
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    // The primary assertion is that we reach here without TSAN reports,
+    // crashes, or deadlocks. The error counter guards against silent corruption.
+    EXPECT_EQ(errors.load(), 0);
 }
 
 }  // namespace

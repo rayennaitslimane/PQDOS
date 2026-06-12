@@ -46,6 +46,7 @@ void MetadataStore::init_schema() {
 }
 
 void MetadataStore::put(const ObjectMetadata& metadata) {
+    std::lock_guard<std::mutex> lock(mu_);
     validate_metadata(metadata);
 
     pqxx::work tx{conn_};
@@ -110,6 +111,7 @@ void MetadataStore::put(const ObjectMetadata& metadata) {
 }
 
 std::optional<ObjectMetadata> MetadataStore::get(const std::string& id) {
+    std::lock_guard<std::mutex> lock(mu_);
     pqxx::read_transaction tx{conn_};
 
     pqxx::result metadata_rows = tx.exec(
@@ -130,6 +132,7 @@ std::optional<ObjectMetadata> MetadataStore::get(const std::string& id) {
 }
 
 bool MetadataStore::remove(const std::string& id) {
+    std::lock_guard<std::mutex> lock(mu_);
     pqxx::work tx{conn_};
 
     pqxx::result result = tx.exec(
@@ -147,6 +150,7 @@ bool MetadataStore::remove(const std::string& id) {
 }
 
 std::vector<ObjectMetadata> MetadataStore::list() {
+    std::lock_guard<std::mutex> lock(mu_);
     pqxx::read_transaction tx{conn_};
 
     pqxx::result rows = tx.exec(

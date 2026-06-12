@@ -20,7 +20,7 @@ Each `StorageNode` embeds one **Lightning Memory-Mapped Database (LMDB)** enviro
 
 - **ACID transactions** — all shards in a single `put()` call are committed atomically in one `mdb_txn_commit`. If the process dies mid-write no partial batch is left on disk.
 - **Memory-mapped reads** — `mdb_get` on a read transaction returns a pointer directly into the mmap region; no copy is made until `bytes_from_mdb_value` copies the bytes into a `std::vector`. This is the fastest possible read path for a key-value store.
-- **Single-writer, multiple-reader** — appropriate for each node process which has one writer (the HTTP handler thread for PUT/DELETE) and potentially concurrent readers (GET handlers). The 1 GB map size is set at open time; no data is pre-allocated.
+- **Single-writer, multiple-reader** — LMDB enforces one writer transaction at a time while allowing concurrent readers. This matches the server's concurrent request model without introducing partial-write visibility. The 1 GB map size is set at open time; no data is pre-allocated.
 
 The environment is opened once in `StorageNode::StorageNode()` and closed in the destructor via RAII. Copy and move constructors are deleted; there is exactly one `StorageNode` per process.
 
@@ -51,7 +51,7 @@ object_shard_locations (
 Key design points:
 - `ON DELETE CASCADE` ensures that deleting a row from `object_metadata` atomically removes all associated shard location rows — no orphaned location records.
 - An index on `object_shard_locations(object_id)` accelerates per-object shard location lookups.
-- All six queries (`put_object_metadata`, `delete_object_shard_locations`, `insert_object_shard_location`, `get_object_metadata`, `remove_object_metadata`, `list_object_metadata`) are registered as **prepared statements** at construction time via `conn_.prepare(...)`. This both eliminates SQL injection risk and avoids repeated query planning overhead.
+- All SQL operations are registered as **prepared statements** at construction time via `conn_.prepare(...)`, including `put_object_metadata`, `delete_object_shard_locations`, `insert_object_shard_location`, `get_object_metadata`, `get_object_shard_locations`, `remove_object_metadata`, and `list_object_metadata`. This both eliminates SQL injection risk and avoids repeated query planning overhead.
 - `put()` uses `ON CONFLICT (id) DO UPDATE` (upsert) so re-uploading an object with the same ID is a safe idempotent operation.
 
 ### Shard location encoding
@@ -59,6 +59,8 @@ Key design points:
 Shard locations are stored as strings of the form `"host:port/object_id-version-shard_index"`, where `version` is a per-`put` random token. The `StorageClient` parses these strings to determine which node to contact and which key to request.
 
 Using a versioned keyspace ensures concurrent writes to the same `object_id` do not overwrite each other's shard payloads in LMDB. Only after all versioned shard writes complete successfully is metadata upserted to reference that exact version.
+
+Per [ADR-0006](0006-concurrency-contract.md), per-object ordering is intentionally not guaranteed. Concurrent `put(X)` / `put(X)` or `put(X)` / `remove(X)` may interleave, producing last-writer-wins metadata and leaving non-referenced versioned shard payloads in LMDB.
 
 This approach avoids a third table but means the storage topology is embedded in every metadata row — changing node addresses requires updating all location strings.
 
@@ -85,8 +87,9 @@ For a collection of N objects this produces N+1 total round-trips to PostgreSQL.
 - The two stores are independently scalable: metadata can be moved to a managed PostgreSQL service without touching shard storage, and vice versa.
 
 **Negative / Risks:**
-- `MetadataStore` holds a single `pqxx::connection`. This connection is not thread-safe (libpqxx connections are not). Concurrent HTTP handler threads calling `get`/`put`/`list` through the same `StorageClient` instance will race on the connection (see ADR-0005).
+- `MetadataStore` still holds a single `pqxx::connection`. [ADR-0006](0006-concurrency-contract.md) fixes thread safety by serialising access with a mutex, but this also serialises all metadata operations through one lock and can become a throughput bottleneck under high concurrency.
 - The N+1 query in `list()` degrades linearly with the number of stored objects and will become unacceptably slow at scale.
 - Shard location strings encode the storage topology. Node address changes require a migration of all location strings in PostgreSQL.
-- Versioned shard keys can leave orphaned shard payloads for losing concurrent writers. This is a storage-leak trade-off that preserves read correctness.
+- Versioned shard keys can leave orphaned shard payloads for losing concurrent writers and for `put/remove` races on the same object ID. This is an intentional storage-leak trade-off that preserves read correctness under the ADR-0006 contract.
+- Multi-process writers sharing the same PostgreSQL metadata are not coordinated by this design; the documented concurrency contract assumes single-process ownership of one `StorageClient` instance.
 - The `erasure_spec` field is stored as `BYTEA` (msgpack blob) rather than as structured columns, making it opaque to SQL queries and migrations.

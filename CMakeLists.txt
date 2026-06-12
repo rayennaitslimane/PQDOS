@@ -23,6 +23,7 @@ add_library(pqdos
     core/MetadataStore.cpp
     core/StorageNode.cpp
     core/StorageNodeServer.cpp
+    core/ShardTransport.cpp
     core/StorageClient.cpp
     core/StorageClientServer.cpp
 )

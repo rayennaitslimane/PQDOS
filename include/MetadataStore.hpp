@@ -5,6 +5,7 @@
 #include <pqxx/pqxx>
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,6 +24,7 @@ public:
 
 private:
     pqxx::connection conn_;
+    std::mutex mu_;
 
     void init_schema();
 

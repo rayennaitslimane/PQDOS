@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <botan/base64.h>
 
 #include <cstdlib>
 #include <string>
@@ -38,7 +39,11 @@ TEST_F(StorageClientServerTest, PutObjectReturnsOk) {
     const std::string data = "hello world";
 
     nlohmann::json payload;
-    payload["data"] = data;
+    payload["data"] = Botan::base64_encode(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    payload["k"] = 2;
+    payload["m"] = 1;
+    payload["shard_size"] = 20;
 
     auto res = client_.Put(
         "/objects/" + id,
@@ -60,7 +65,11 @@ TEST_F(StorageClientServerTest, GetObjectReturnsStoredData) {
     const std::string data = "stored content";
 
     nlohmann::json payload;
-    payload["data"] = data;
+    payload["data"] = Botan::base64_encode(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    payload["k"] = 2;
+    payload["m"] = 1;
+    payload["shard_size"] = 20;
 
     client_.Put("/objects/" + id, payload.dump(), "application/json");
 
@@ -72,7 +81,9 @@ TEST_F(StorageClientServerTest, GetObjectReturnsStoredData) {
     auto body = nlohmann::json::parse(res->body);
     ASSERT_TRUE(body.contains("data"));
 
-    std::string result = body["data"].get<std::string>();
+    std::string b64_result = body["data"].get<std::string>();
+    auto decoded = Botan::base64_decode(b64_result);
+    std::string result(decoded.begin(), decoded.end());
     EXPECT_EQ(result, data);
 
     cleanup(id);
@@ -83,7 +94,11 @@ TEST_F(StorageClientServerTest, DeleteObjectReturnsOk) {
     const std::string data = "to be deleted";
 
     nlohmann::json payload;
-    payload["data"] = data;
+    payload["data"] = Botan::base64_encode(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    payload["k"] = 2;
+    payload["m"] = 1;
+    payload["shard_size"] = 20;
 
     client_.Put("/objects/" + id, payload.dump(), "application/json");
 
@@ -111,7 +126,11 @@ TEST_F(StorageClientServerTest, ListObjectsReturnsArray) {
     const std::string data = "list me";
 
     nlohmann::json payload;
-    payload["data"] = data;
+    payload["data"] = Botan::base64_encode(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    payload["k"] = 2;
+    payload["m"] = 1;
+    payload["shard_size"] = 20;
 
     client_.Put("/objects/" + id, payload.dump(), "application/json");
 

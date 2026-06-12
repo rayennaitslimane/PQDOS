@@ -1,5 +1,6 @@
 #include "StorageClientServer.hpp"
 
+#include <botan/base64.h>
 #include <nlohmann/json.hpp>
 
 #include <string>
@@ -58,10 +59,36 @@ void StorageClientServer::setup_routes() {
         }
 
         const std::string& raw = input["data"].get_ref<const std::string&>();
-        Bytes bytes(raw.begin(), raw.end());
+
+        Bytes bytes;
+        try {
+            auto decoded = Botan::base64_decode(raw);
+            bytes.assign(decoded.begin(), decoded.end());
+        } catch (const std::exception&) {
+            nlohmann::json body;
+            body["error"] = "invalid base64 in 'data' field";
+            res.status = 400;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        if (!input.contains("k") || !input["k"].is_number_unsigned() ||
+            !input.contains("m") || !input["m"].is_number_unsigned() ||
+            !input.contains("shard_size") || !input["shard_size"].is_number_unsigned()) {
+            nlohmann::json body;
+            body["error"] = "missing or invalid erasure fields ('k', 'm', 'shard_size')";
+            res.status = 400;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        ErasureSpec erasure_spec;
+        erasure_spec.data_shards = input["k"].get<uint32_t>();
+        erasure_spec.parity_shards = input["m"].get<uint32_t>();
+        erasure_spec.shard_size = input["shard_size"].get<std::size_t>();
 
         try {
-            client_.put(id, bytes);
+            client_.put(id, bytes, erasure_spec);
         } catch (const std::exception& e) {
             nlohmann::json body;
             body["error"] = e.what();
@@ -98,7 +125,7 @@ void StorageClientServer::setup_routes() {
         }
 
         nlohmann::json body;
-        body["data"] = std::string(bytes.begin(), bytes.end());
+        body["data"] = Botan::base64_encode(bytes.data(), bytes.size());
         res.set_content(body.dump(), "application/json");
     });
 

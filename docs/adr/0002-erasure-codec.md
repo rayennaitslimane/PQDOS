@@ -19,16 +19,21 @@ The system needs a codec that:
 
 **Intel ISA-L** (`gf_gen_rs_matrix` / `ec_init_tables` / `ec_encode_data`) is used to implement Reed-Solomon erasure coding over GF(2⁸). ISA-L uses SIMD-accelerated Galois Field arithmetic (SSE/AVX on x86) making it substantially faster than portable RS implementations for the parity-generation inner loop.
 
-### Fixed parameters: k=2, m=1, shard\_size=20
+### Configurable parameters: k, m, shard\_size
+
+Erasure parameters are supplied per-object via the `ErasureSpec` struct passed to `StorageClient::put()`:
 
 ```cpp
-constexpr uint32_t kDataShards   = 2;
-constexpr uint32_t kParityShards = 1;
-constexpr std::size_t kShardSize = 20;
+struct ErasureSpec {
+    uint32_t data_shards;    // k
+    uint32_t parity_shards;  // m
+    std::size_t shard_size;
+};
 ```
 
-- **k=2, m=1** means the object is split into 2 data shards and 1 parity shard (total 3 shards). The object can be recovered from any 2 of the 3 shards, tolerating the loss of any single node.
-- **shard\_size=20** is a POC constant sized for unit-test payloads. It caps the maximum storable object at `k × shard_size = 40 bytes`. This must be replaced with a dynamic value computed from the actual object size before any production use.
+The HTTP PUT body includes `"k"`, `"m"`, and `"shard_size"` fields. `StorageClientServer` constructs an `ErasureSpec` from these and forwards it to `StorageClient::put()`. This allows callers to choose different durability and capacity profiles per object without code changes.
+
+Validation at the `StorageClient::put()` level ensures `data_shards + parity_shards` does not exceed the number of available storage nodes. The `encode()` / `decode()` functions validate the remaining constraints (non-zero values, GF(2⁸) limit of 255 total shards, shard size within ISA-L int bounds).
 
 ### Padding model
 
@@ -58,7 +63,5 @@ Shards are stored and retrieved as a `std::vector<PlainShard>` where `PlainShard
 - Zero-padding with stored original length is a simple, correct approach to variable-length inputs.
 
 **Negative / Risks:**
-- `kShardSize = 20` must be made dynamic before storing real data. The current value causes a hard exception for any object larger than 40 bytes.
 - The `encode` / `decode` functions reference global types (`Bytes`, `PlainShard`, `ErasureSpec`) declared in `Models.hpp` without including it — they rely on the caller's translation unit having already included `Models.hpp`. This implicit coupling should be made explicit via a direct `#include` in `ErasureCodec.hpp`.
 - The `<iostream>` include in `ErasureCodec.hpp` is unused and should be removed.
-- Parameters are compile-time constants in an anonymous namespace inside `StorageClient.cpp`, not in `ErasureCodec`. A caller wanting a different erasure configuration has no clean extension point.

@@ -11,4 +11,5 @@ Each ADR documents a significant design choice: its context, the decision made, 
 | [0002](0002-erasure-codec.md) | Erasure Codec | Accepted |
 | [0003](0003-dual-storage.md) | Dual Storage | Accepted |
 | [0004](0004-shard-transport.md) | Shard Transport | Accepted |
-| [0005](0005-http-surface.md) | HTTP Surface | Accepted (known gaps) |
+| [0005](0005-http-surface.md) | HTTP Surface | Accepted |
+| [0006](0006-concurrency-contract.md) | Concurrency Contract | Accepted |

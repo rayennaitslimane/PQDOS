@@ -4,11 +4,13 @@
 #include <gtest/gtest.h>
 #include <pqxx/pqxx>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -330,6 +332,78 @@ TEST_F(MetadataStoreTest, PutRejectsInvalidUuidFromDatabaseCast) {
     // validate_metadata only checks non-empty ID.
     // PostgreSQL should reject this because prepared SQL casts $1::uuid.
     EXPECT_THROW(store_->put(metadata), std::exception);
+}
+
+// ===========================================================================
+// Concurrency contract validation
+// ===========================================================================
+
+// Verifies that concurrent put/get/remove/list on a single MetadataStore
+// instance (single pqxx::connection) does not crash, deadlock, or produce
+// data races. Validates contract point 1: MetadataStore serialization.
+TEST_F(MetadataStoreTest, ConcurrentMetadataStoreAccessOnSingleClient) {
+    constexpr int kNumThreads = 8;
+    constexpr int kOpsPerThread = 10;
+
+    std::atomic<int> errors{0};
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < kNumThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int i = 0; i < kOpsPerThread; ++i) {
+                // Each thread uses its own UUID range to avoid logical conflicts
+                std::string id = "00000000-0000-0000-0000-0000000" +
+                    std::to_string(50000 + t * 100 + i);
+
+                auto metadata = makeMetadata(
+                    id,
+                    static_cast<std::size_t>(100 + i),
+                    "sha256:concurrent-" + std::to_string(t) + "-" + std::to_string(i),
+                    {"node-a:/shard-" + std::to_string(t) + "-" + std::to_string(i)}
+                );
+
+                try {
+                    // put
+                    store_->put(metadata);
+
+                    // get
+                    auto retrieved = store_->get(id);
+                    if (!retrieved.has_value()) {
+                        ++errors;
+                        continue;
+                    }
+                    if (retrieved->id != id) {
+                        ++errors;
+                    }
+
+                    // list (exercises read path concurrently)
+                    auto items = store_->list();
+                    (void)items;
+
+                    // remove
+                    bool removed = store_->remove(id);
+                    if (!removed) {
+                        ++errors;
+                    }
+                } catch (const std::exception&) {
+                    ++errors;
+                }
+            }
+        });
+    }
+
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    EXPECT_EQ(errors.load(), 0)
+        << "Concurrent MetadataStore operations must not crash or corrupt";
+
+    // After all threads complete, the store should be empty
+    // (each thread removes what it inserted)
+    auto remaining = store_->list();
+    EXPECT_TRUE(remaining.empty())
+        << "All objects should have been removed; found " << remaining.size();
 }
 
 } // namespace

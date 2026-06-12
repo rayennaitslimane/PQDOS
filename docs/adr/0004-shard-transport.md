@@ -26,7 +26,7 @@ for (std::size_t i = 0; i < total_shards; ++i) {
 }
 ```
 
-Node addresses are read once at static-initialisation time from the `NODE_ADDRESSES` environment variable (comma-separated, exactly `kNumNodes=3` entries), falling back to `localhost:9001,9002,9003`. The parsed array is a `const` static, so parsing happens once per process lifetime.
+Node addresses are read once at static-initialisation time from the `NODE_ADDRESSES` environment variable (comma-separated, exactly `kNumNodes=3` entries), falling back to `localhost:9001,localhost:9002,localhost:9003`. The parsed array is a `const` static, so parsing happens once per process lifetime.
 
 ### Write atomicity model: versioned shard keyspace
 
@@ -35,6 +35,8 @@ Each `put` generates a new random `version` token and writes shards under keys o
 `object_id-version-shard_index`
 
 This prevents concurrent writers for the same `object_id` from clobbering each other's shard payloads.
+
+Per [ADR-0006](0006-concurrency-contract.md), concurrent same-object operations are intentionally not globally ordered. Versioning prevents key clobbering at the shard store level, but metadata remains last-writer-wins and `put/remove` interleavings may still leave orphaned shard payloads.
 
 Write ordering is:
 1. Encode and encrypt shards.
@@ -79,14 +81,14 @@ Parallel dispatch using `std::async` achieves the latency profile:
 | Operation | Latency | Improvement |
 |-----------|---------|-------------|
 | `put` | `max(RTT₀, RTT₁, RTT₂)` | 3× vs. sequential |
-| `get` | `max` of the `k` fastest nodes | 3× vs. sequential |
+| `get` | `max(RTT₀, RTT₁, RTT₂)` in the healthy case | up to 3× vs. sequential |
 | `delete` | `max(RTT₀, RTT₁, RTT₂)` | 3× vs. sequential |
 
 For 3 nodes with equal latencies, this eliminates ~67% of transport time compared to sequential dispatch. Individual node failures remain transparent to the caller (erasure tolerance on read, best-effort on delete).
 
-### Known latency cost: no connection pooling
+### Known latency cost: no cross-call connection pooling
 
-A new `httplib::Client` is instantiated for every shard operation, performing a full TCP handshake each time. Persistent clients (one per node address, reused across calls) would eliminate connection setup overhead, which dominates at small payload sizes (the current `kShardSize = 20` byte shards are smaller than a TCP packet).
+A new `httplib::Client` is instantiated once per node task for each high-level operation (`put`, `get`, `delete`). Within that task, multiple shards are sent sequentially on the same client instance. Clients are not reused across separate API calls, so repeated operations still pay setup overhead. Persistent per-node clients reused across calls would reduce this overhead, especially with small payload sizes (`kShardSize = 20`).
 
 ### No HTTP timeouts
 
@@ -109,7 +111,7 @@ client.set_read_timeout(1, 0);             // 1 s
 - Environment-variable-driven node discovery is simple and Docker/container-friendly.
 
 **Remaining trade-offs:**
-- No connection pooling: a new `httplib::Client` is instantiated per operation per node, performing a full TCP handshake each time. This overhead dominates at small payload sizes (current `kShardSize = 20` bytes). Persistent clients (one per node, reused across calls) would further reduce overhead.
+- No cross-call connection pooling: a new `httplib::Client` is created per operation per node task and then discarded. This overhead is significant at small payload sizes (current `kShardSize = 20` bytes). Persistent clients (one per node, reused across calls) would further reduce overhead.
 - No HTTP timeouts: a single unresponsive node will block the entire operation indefinitely. Timeouts must be configured before production network exposure.
-- Versioned writes can leave orphaned shard payloads for write attempts that lose the metadata upsert race.
+- Versioned writes can leave orphaned shard payloads for write attempts that lose the metadata upsert race, and for same-object `put/remove` interleavings allowed by ADR-0006.
 - Static placement strategy (`shard i → node i`) has no rebalancing, no consistent hashing, and cannot handle node addition/removal without changing `kNumNodes` and redeploying.
