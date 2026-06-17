@@ -2,6 +2,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <botan/base64.h>
+#include <pqxx/pqxx>
 
 #include <cstdlib>
 #include <string>
@@ -25,12 +26,47 @@ int testPort() {
     return kDefaultPort;
 }
 
+std::string testConnectionString() {
+    if (const char* env = std::getenv("METADATASTORE_TEST_CONN")) {
+        return std::string{env};
+    }
+
+    return "host=localhost "
+           "port=5433 "
+           "dbname=pqdos_test "
+           "user=test_user "
+           "password=test_password";
+}
+
 class StorageClientServerTest : public ::testing::Test {
 protected:
     httplib::Client client_{testHost(), testPort()};
 
+    void SetUp() override {
+        seedNodes();
+    }
+
     void cleanup(const std::string& id) {
         (void)client_.Delete("/objects/" + id);
+    }
+
+    void seedNodes() {
+        pqxx::connection conn{testConnectionString()};
+        pqxx::work tx{conn};
+
+        tx.exec(R"SQL(
+            CREATE TABLE IF NOT EXISTS nodes (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                address TEXT NOT NULL UNIQUE,
+                registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        )SQL");
+
+        tx.exec("INSERT INTO nodes (address) VALUES ('localhost:9001') ON CONFLICT DO NOTHING");
+        tx.exec("INSERT INTO nodes (address) VALUES ('localhost:9002') ON CONFLICT DO NOTHING");
+        tx.exec("INSERT INTO nodes (address) VALUES ('localhost:9003') ON CONFLICT DO NOTHING");
+
+        tx.commit();
     }
 };
 
@@ -186,6 +222,166 @@ TEST_F(StorageClientServerTest, PutMissingDataFieldReturns400) {
 
     auto body = nlohmann::json::parse(res->body);
     EXPECT_EQ(body["error"], "missing or invalid 'data' field");
+}
+
+// ===========================================================================
+// Health endpoint tests
+// ===========================================================================
+
+TEST_F(StorageClientServerTest, HealthReturnsFullyReplicatedForHealthyObject) {
+    const std::string id = "00000000-0000-0000-0000-000000000301";
+    const std::string data = "health-route-test";
+
+    nlohmann::json payload;
+    payload["data"] = Botan::base64_encode(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    payload["k"] = 2;
+    payload["m"] = 1;
+    payload["shard_size"] = 20;
+
+    auto put_res = client_.Put("/objects/" + id, payload.dump(), "application/json");
+    ASSERT_TRUE(put_res);
+    ASSERT_EQ(put_res->status, 200);
+
+    auto res = client_.Get("/objects/" + id + "/health");
+
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    EXPECT_EQ(body["object_id"], id);
+    EXPECT_EQ(body["total_shards"], 3);
+    EXPECT_EQ(body["available_shards"], 3);
+    EXPECT_EQ(body["required_shards"], 2);
+    EXPECT_TRUE(body["healthy"].get<bool>());
+    EXPECT_TRUE(body["fully_replicated"].get<bool>());
+    EXPECT_TRUE(body["missing_indices"].empty());
+
+    cleanup(id);
+}
+
+TEST_F(StorageClientServerTest, HealthReturns500ForMissingObject) {
+    auto res = client_.Get("/objects/00000000-0000-0000-0000-ffffffffffff/health");
+
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 500);
+
+    auto body = nlohmann::json::parse(res->body);
+    EXPECT_TRUE(body.contains("error"));
+}
+
+// ===========================================================================
+// Repair endpoint tests
+// ===========================================================================
+
+TEST_F(StorageClientServerTest, RepairReturnsOkForHealthyObject) {
+    const std::string id = "00000000-0000-0000-0000-000000000302";
+    const std::string data = "repair-route-test!";
+
+    nlohmann::json payload;
+    payload["data"] = Botan::base64_encode(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    payload["k"] = 2;
+    payload["m"] = 1;
+    payload["shard_size"] = 20;
+
+    auto put_res = client_.Put("/objects/" + id, payload.dump(), "application/json");
+    ASSERT_TRUE(put_res);
+    ASSERT_EQ(put_res->status, 200);
+
+    auto res = client_.Post("/objects/" + id + "/repair", "", "application/json");
+
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    EXPECT_EQ(body["status"], "ok");
+    EXPECT_TRUE(body["repaired"].get<bool>());
+
+    cleanup(id);
+}
+
+TEST_F(StorageClientServerTest, RepairRestoresDegradedObject) {
+    const std::string id = "00000000-0000-0000-0000-000000000303";
+    const std::string data = "repair-degrade-test";
+
+    nlohmann::json payload;
+    payload["data"] = Botan::base64_encode(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    payload["k"] = 2;
+    payload["m"] = 1;
+    payload["shard_size"] = 20;
+
+    auto put_res = client_.Put("/objects/" + id, payload.dump(), "application/json");
+    ASSERT_TRUE(put_res);
+    ASSERT_EQ(put_res->status, 200);
+
+    // Use metadata to find the shard key
+    // We know shard 0 is on node 9001 (first eligible node by registry order)
+    // Construct the shard location from the object metadata
+    {
+        pqxx::connection conn{testConnectionString()};
+        pqxx::read_transaction tx{conn};
+        auto rows = tx.exec(
+            "SELECT location FROM object_shard_locations "
+            "WHERE object_id = '" + id + "' ORDER BY shard_index ASC LIMIT 1"
+        );
+        ASSERT_FALSE(rows.empty());
+        std::string full_location = rows[0][0].c_str();
+        // full_location is "host:port/key" - extract path after first /
+        std::string shard_key = full_location.substr(full_location.find('/') + 1);
+
+        httplib::Client node("localhost", 9001);
+        auto del_res = node.Delete("/shards?location=" + shard_key);
+        ASSERT_TRUE(del_res);
+        ASSERT_EQ(del_res->status, 200);
+    }
+
+    // Verify degraded
+    {
+        auto health_res = client_.Get("/objects/" + id + "/health");
+        auto body = nlohmann::json::parse(health_res->body);
+        EXPECT_FALSE(body["fully_replicated"].get<bool>());
+    }
+
+    // Repair
+    auto repair_res = client_.Post("/objects/" + id + "/repair", "", "application/json");
+    ASSERT_TRUE(repair_res);
+    EXPECT_EQ(repair_res->status, 200);
+
+    auto repair_body = nlohmann::json::parse(repair_res->body);
+    EXPECT_TRUE(repair_body["repaired"].get<bool>());
+
+    // Verify restored
+    {
+        auto health_res = client_.Get("/objects/" + id + "/health");
+        auto body = nlohmann::json::parse(health_res->body);
+        EXPECT_TRUE(body["fully_replicated"].get<bool>());
+    }
+
+    // Data still correct
+    {
+        auto get_res = client_.Get("/objects/" + id);
+        ASSERT_TRUE(get_res);
+        ASSERT_EQ(get_res->status, 200);
+        auto body = nlohmann::json::parse(get_res->body);
+        auto decoded = Botan::base64_decode(body["data"].get<std::string>());
+        std::string result(decoded.begin(), decoded.end());
+        EXPECT_EQ(result, data);
+    }
+
+    cleanup(id);
+}
+
+TEST_F(StorageClientServerTest, RepairReturns500ForMissingObject) {
+    auto res = client_.Post(
+        "/objects/00000000-0000-0000-0000-ffffffffffff/repair", "", "application/json");
+
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 500);
+
+    auto body = nlohmann::json::parse(res->body);
+    EXPECT_TRUE(body.contains("error"));
 }
 
 } // namespace

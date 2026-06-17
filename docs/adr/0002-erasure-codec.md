@@ -41,7 +41,7 @@ If the final data shard is not full, the remainder is zero-padded to `shard_size
 
 ### Encode signature and ownership
 
-`encode(Bytes& data, ErasureSpec& erasure_spec)` takes both arguments by non-const reference. In practice `encode` only reads `data` — it does not mutate it. The non-const signature forces callers to make a defensive copy:
+`encode(Bytes& data, ErasureSpec& erasure_spec)` takes both arguments by non-const reference. In practice `encode` only reads `data` - it does not mutate it. The non-const signature forces callers to make a defensive copy:
 
 ```cpp
 Bytes mutable_input = bytes;  // StorageClient::put
@@ -63,5 +63,5 @@ Shards are stored and retrieved as a `std::vector<PlainShard>` where `PlainShard
 - Zero-padding with stored original length is a simple, correct approach to variable-length inputs.
 
 **Negative / Risks:**
-- The `encode` / `decode` functions reference global types (`Bytes`, `PlainShard`, `ErasureSpec`) declared in `Models.hpp` without including it — they rely on the caller's translation unit having already included `Models.hpp`. This implicit coupling should be made explicit via a direct `#include` in `ErasureCodec.hpp`.
+- The `encode` / `decode` functions reference global types (`Bytes`, `PlainShard`, `ErasureSpec`) declared in `Models.hpp` without including it - they rely on the caller's translation unit having already included `Models.hpp`. This implicit coupling should be made explicit via a direct `#include` in `ErasureCodec.hpp`.
 - The `<iostream>` include in `ErasureCodec.hpp` is unused and should be removed.

@@ -187,4 +187,65 @@ void StorageClientServer::setup_routes() {
 
         res.set_content(body.dump(), "application/json");
     });
+
+    server_.Get("/objects/:id/health", [this](const httplib::Request& req, httplib::Response& res) {
+        const std::string id = req.path_params.at("id");
+
+        if (id.empty()) {
+            nlohmann::json body;
+            body["error"] = "id must not be empty";
+            res.status = 400;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        ObjectHealth h;
+        try {
+            h = client_.health(id);
+        } catch (const std::exception& e) {
+            nlohmann::json body;
+            body["error"] = e.what();
+            res.status = 500;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        nlohmann::json body;
+        body["object_id"] = h.object_id;
+        body["total_shards"] = h.total_shards;
+        body["available_shards"] = h.available_shards;
+        body["required_shards"] = h.required_shards;
+        body["missing_indices"] = h.missing_indices;
+        body["healthy"] = h.healthy;
+        body["fully_replicated"] = h.fully_replicated;
+        res.set_content(body.dump(), "application/json");
+    });
+
+    server_.Post("/objects/:id/repair", [this](const httplib::Request& req, httplib::Response& res) {
+        const std::string id = req.path_params.at("id");
+
+        if (id.empty()) {
+            nlohmann::json body;
+            body["error"] = "id must not be empty";
+            res.status = 400;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        bool repaired = false;
+        try {
+            repaired = client_.repair(id);
+        } catch (const std::exception& e) {
+            nlohmann::json body;
+            body["error"] = e.what();
+            res.status = 500;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        nlohmann::json body;
+        body["status"] = "ok";
+        body["repaired"] = repaired;
+        res.set_content(body.dump(), "application/json");
+    });
 }

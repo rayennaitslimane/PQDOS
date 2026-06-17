@@ -21,6 +21,7 @@ add_library(pqdos
     core/ErasureCodec.cpp
     core/Crypto.cpp
     core/MetadataStore.cpp
+    core/MetricsCollector.cpp
     core/StorageNode.cpp
     core/StorageNodeServer.cpp
     core/ShardTransport.cpp
@@ -83,6 +84,9 @@ target_link_libraries(storage_node PRIVATE pqdos)
 
 add_executable(storage_client cmd/StorageClientMain.cpp)
 target_link_libraries(storage_client PRIVATE pqdos)
+
+add_executable(benchmark cmd/BenchmarkMain.cpp)
+target_link_libraries(benchmark PRIVATE pqdos)
 
 install(TARGETS pqdos storage_node storage_client
     LIBRARY DESTINATION lib

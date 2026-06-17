@@ -16,11 +16,19 @@ public:
 
     void put(const ObjectMetadata& metadata);
 
+    bool conditional_put(const ObjectMetadata& metadata, int expected_version);
+
     std::optional<ObjectMetadata> get(const std::string& id);
 
     bool remove(const std::string& id);
 
     std::vector<ObjectMetadata> list();
+
+    void register_node(const std::string& address);
+
+    bool unregister_node(const std::string& address);
+
+    std::vector<std::string> list_nodes();
 
 private:
     pqxx::connection conn_;

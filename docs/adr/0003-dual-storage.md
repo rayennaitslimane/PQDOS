@@ -7,8 +7,8 @@
 
 The system manages two fundamentally different categories of data:
 
-1. **Shard payloads** — opaque binary blobs (encrypted shard ciphertext + nonce), written and read by key, with no relational structure, high write throughput requirements, and a need for crash-safe atomic multi-shard transactions.
-2. **Object metadata** — structured records (object ID, size, checksum, erasure parameters, shard location strings, wrapped DEK, KEK ID) that must be queryable, must support cascading deletes, and form the authoritative index for reconstructing any object.
+1. **Shard payloads** - opaque binary blobs (encrypted shard ciphertext + nonce), written and read by key, with no relational structure, high write throughput requirements, and a need for crash-safe atomic multi-shard transactions.
+2. **Object metadata** - structured records (object ID, size, checksum, erasure parameters, shard location strings, wrapped DEK, KEK ID) that must be queryable, must support cascading deletes, and form the authoritative index for reconstructing any object.
 
 Using a single storage technology for both categories would either force a relational database to handle large binary blobs inefficiently or force a key-value store to implement relational integrity manually.
 
@@ -18,9 +18,9 @@ Using a single storage technology for both categories would either force a relat
 
 Each `StorageNode` embeds one **Lightning Memory-Mapped Database (LMDB)** environment opened at a configurable filesystem path. LMDB provides:
 
-- **ACID transactions** — all shards in a single `put()` call are committed atomically in one `mdb_txn_commit`. If the process dies mid-write no partial batch is left on disk.
-- **Memory-mapped reads** — `mdb_get` on a read transaction returns a pointer directly into the mmap region; no copy is made until `bytes_from_mdb_value` copies the bytes into a `std::vector`. This is the fastest possible read path for a key-value store.
-- **Single-writer, multiple-reader** — LMDB enforces one writer transaction at a time while allowing concurrent readers. This matches the server's concurrent request model without introducing partial-write visibility. The 1 GB map size is set at open time; no data is pre-allocated.
+- **ACID transactions** - all shards in a single `put()` call are committed atomically in one `mdb_txn_commit`. If the process dies mid-write no partial batch is left on disk.
+- **Memory-mapped reads** - `mdb_get` on a read transaction returns a pointer directly into the mmap region; no copy is made until `bytes_from_mdb_value` copies the bytes into a `std::vector`. This is the fastest possible read path for a key-value store.
+- **Single-writer, multiple-reader** - LMDB enforces one writer transaction at a time while allowing concurrent readers. This matches the server's concurrent request model without introducing partial-write visibility. The 1 GB map size is set at open time; no data is pre-allocated.
 
 The environment is opened once in `StorageNode::StorageNode()` and closed in the destructor via RAII. Copy and move constructors are deleted; there is exactly one `StorageNode` per process.
 
@@ -49,24 +49,26 @@ object_shard_locations (
 ```
 
 Key design points:
-- `ON DELETE CASCADE` ensures that deleting a row from `object_metadata` atomically removes all associated shard location rows — no orphaned location records.
+- `ON DELETE CASCADE` ensures that deleting a row from `object_metadata` atomically removes all associated shard location rows - no orphaned location records.
 - An index on `object_shard_locations(object_id)` accelerates per-object shard location lookups.
 - All SQL operations are registered as **prepared statements** at construction time via `conn_.prepare(...)`, including `put_object_metadata`, `delete_object_shard_locations`, `insert_object_shard_location`, `get_object_metadata`, `get_object_shard_locations`, `remove_object_metadata`, and `list_object_metadata`. This both eliminates SQL injection risk and avoids repeated query planning overhead.
 - `put()` uses `ON CONFLICT (id) DO UPDATE` (upsert) so re-uploading an object with the same ID is a safe idempotent operation.
 
 ### Shard location encoding
 
-Shard locations are stored as strings of the form `"host:port/object_id-version-shard_index"`, where `version` is a per-`put` random token. The `StorageClient` parses these strings to determine which node to contact and which key to request.
+Shard locations are stored as strings of the form `"host:port/object_id/version/shard_index"`, where `version` is a per-`put` random token. The internal shard key format is `object_id/version/shard_index`.
+
+Parsing invariant: the first `/` splits node address from shard key (`host:port/key`), and all remaining `/` separators belong to the shard key.
 
 Using a versioned keyspace ensures concurrent writes to the same `object_id` do not overwrite each other's shard payloads in LMDB. Only after all versioned shard writes complete successfully is metadata upserted to reference that exact version.
 
 Per [ADR-0006](0006-concurrency-contract.md), per-object ordering is intentionally not guaranteed. Concurrent `put(X)` / `put(X)` or `put(X)` / `remove(X)` may interleave, producing last-writer-wins metadata and leaving non-referenced versioned shard payloads in LMDB.
 
-This approach avoids a third table but means the storage topology is embedded in every metadata row — changing node addresses requires updating all location strings.
+This approach avoids a third table but means the storage topology is embedded in every metadata row - changing node addresses requires updating all location strings.
 
 ### Known gap: N+1 query in `list()`
 
-`MetadataStore::list()` issues one SQL query to fetch all object rows and then calls `get_shard_locations()` — a second query — for each object:
+`MetadataStore::list()` issues one SQL query to fetch all object rows and then calls `get_shard_locations()` - a second query - for each object:
 
 ```cpp
 for (const auto& row : rows) {
@@ -81,7 +83,7 @@ For a collection of N objects this produces N+1 total round-trips to PostgreSQL.
 
 **Positive:**
 - LMDB's memory-mapped design gives near-zero-copy shard reads; no intermediate buffer allocation in the storage layer.
-- LMDB's single-file, single-process model is operationally simple — no daemon, no network, no separate configuration.
+- LMDB's single-file, single-process model is operationally simple - no daemon, no network, no separate configuration.
 - PostgreSQL provides referential integrity, cascading deletes, and a rich query interface for metadata without any manual bookkeeping.
 - Prepared statements prevent SQL injection and reduce per-query planning cost.
 - The two stores are independently scalable: metadata can be moved to a managed PostgreSQL service without touching shard storage, and vice versa.

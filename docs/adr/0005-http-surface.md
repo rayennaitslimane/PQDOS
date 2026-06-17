@@ -12,8 +12,8 @@ Both the client-facing API (`StorageClientServer`) and the internal shard API (`
 - Consistent error response format
 
 Two additional cross-cutting concerns arise at this layer:
-1. **Binary data encoding** — objects are arbitrary byte sequences; the wire format must represent them faithfully.
-2. **Thread safety** — cpp-httplib dispatches requests on a thread pool; `StorageClient` and `MetadataStore` must be safe to call from concurrent handler invocations.
+1. **Binary data encoding** - objects are arbitrary byte sequences; the wire format must represent them faithfully.
+2. **Thread safety** - cpp-httplib dispatches requests on a thread pool; `StorageClient` and `MetadataStore` must be safe to call from concurrent handler invocations.
 
 ## Decision
 
@@ -30,14 +30,16 @@ Servers expose the following routes:
 | `GET` | `/objects/:id` | Retrieve an object |
 | `DELETE` | `/objects/:id` | Remove an object |
 | `GET` | `/objects` | List all objects |
+| `GET` | `/objects/:id/health` | Inspect shard availability |
+| `POST` | `/objects/:id/repair` | Repair degraded object |
 
 **StorageNodeServer** (internal shard storage):
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Liveness probe |
-| `PUT` | `/shards/:location` | Store a shard payload |
-| `GET` | `/shards/:location` | Retrieve a shard payload |
-| `DELETE` | `/shards/:location` | Remove a shard payload |
+| `PUT` | `/shards?location=<shard_key>` | Store a shard payload |
+| `GET` | `/shards?location=<shard_key>` | Retrieve a shard payload |
+| `DELETE` | `/shards?location=<shard_key>` | Remove a shard payload |
 
 Error responses are JSON objects with an `"error"` string field. Success responses are JSON objects with a `"status": "ok"` field or a `"data"` field (and `/objects` returns a JSON array). Current status semantics are mixed: validation errors return 400, missing objects in `DELETE /objects/:id` return 404, but most backend errors (including missing objects in `GET /objects/:id`) currently surface as 500.
 
@@ -65,15 +67,15 @@ body["data"] = Botan::base64_encode(bytes.data(), bytes.size());
 
 This encoding is safe for arbitrary binary payloads including null bytes and invalid UTF-8 sequences.
 
-Shard payloads between `StorageClient` and `StorageNodeServer` are transmitted as raw `application/octet-stream` bodies — this is correct and has no encoding issue.
+Shard payloads between `StorageClient` and `StorageNodeServer` are transmitted as raw `application/octet-stream` bodies - this is correct and has no encoding issue.
 
 ### Thread safety: resolved by ADR-0006
 
 cpp-httplib's thread pool means handler lambdas for `StorageClientServer` execute concurrently. The two data races that existed at initial design have been addressed:
 
-1. **`StorageClient`** — `kek_ring_` and `active_kek_id_` are now guarded by a `std::shared_mutex`. Concurrent `put()`/`get()` acquire shared locks; `rotate()` acquires an exclusive lock. The lock is scoped narrowly and is never held across HTTP I/O.
+1. **`StorageClient`** - `kek_ring_` and `active_kek_id_` are now guarded by a `std::shared_mutex`. Concurrent `put()`/`get()` acquire shared locks; `rotate()` acquires an exclusive lock. The lock is scoped narrowly and is never held across HTTP I/O.
 
-2. **`MetadataStore::conn_`** — `pqxx::connection` is not thread-safe. A `std::mutex` serialises all public methods on the single connection instance.
+2. **`MetadataStore::conn_`** - `pqxx::connection` is not thread-safe. A `std::mutex` serialises all public methods on the single connection instance.
 
 See [ADR-0006](0006-concurrency-contract.md) for the full concurrency contract, including explicitly tolerated races (per-object ordering is not guaranteed).
 
@@ -84,9 +86,9 @@ See [ADR-0006](0006-concurrency-contract.md) for the full concurrency contract, 
 ## Consequences
 
 **Positive:**
-- cpp-httplib requires zero daemon setup and compiles cleanly into the binary — minimal operational surface for a POC.
+- cpp-httplib requires zero daemon setup and compiles cleanly into the binary - minimal operational surface for a POC.
 - Consistent JSON error responses are easy to test and consume programmatically.
-- `application/octet-stream` for shard payloads is efficient and correct — no encoding overhead on the internal hot path.
+- `application/octet-stream` for shard payloads is efficient and correct - no encoding overhead on the internal hot path.
 - Destructor-called `stop()` ensures the server does not outlive its owning object.
 
 **Negative / Risks:**

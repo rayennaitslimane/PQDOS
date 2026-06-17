@@ -89,7 +89,8 @@ protected:
         tx.exec(R"SQL(
             TRUNCATE TABLE
                 object_shard_locations,
-                object_metadata
+                object_metadata,
+                nodes
             RESTART IDENTITY
             CASCADE
         )SQL");

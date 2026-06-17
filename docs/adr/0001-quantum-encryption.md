@@ -21,7 +21,7 @@ The design must be implementable today without waiting for full NIST PQC standar
 - Each shard of the object is encrypted independently with **AES-256-GCM** using that DEK.
 - The DEK is wrapped using an **ML-KEM-768 Key Encryption Key (KEK)** through Botan's KEM API: the code encapsulates a shared secret with `PK_KEM_Encryptor` (`HKDF(SHA-256)`), then encrypts the DEK with **AES-256-GCM** under that shared secret.
 - The wrapped DEK is stored in PostgreSQL alongside the object metadata, not in the shard nodes.
-- The active KEK private key lives on disk at a configurable path (default `/tmp/pqdos_test_kek.json`, overridable via `PQDOS_KEYSTORE_PATH`), written with `0600` file permissions and `0700` on the parent directory.
+- The active KEK private key lives on disk at a configurable path (default `/tmp/pqdos_kek.json`, overridable via `PQDOS_KEYSTORE_PATH`), written with `0600` file permissions and `0700` on the parent directory.
 
 ### Shard index as AEAD associated data
 
@@ -34,7 +34,7 @@ enc->set_associated_data(
 );
 ```
 
-This makes any ciphertext-swapping or reordering between shard slots a detectable authentication failure — the tag verification will fail if shard `i`'s ciphertext is presented under shard `j`'s index.
+This makes any ciphertext-swapping or reordering between shard slots a detectable authentication failure - the tag verification will fail if shard `i`'s ciphertext is presented under shard `j`'s index.
 
 ### Per-shard nonces
 
@@ -50,7 +50,7 @@ Botan::secure_scrub_memory(dek.data(), dek.size());
 
 ### Key rotation
 
-`StorageClient::rotate()` generates a new ML-KEM-768 key pair, adds it to the in-process key ring, promotes it to `active_kek_id_`, and persists the updated ring to disk. New objects written after rotation are wrapped under the new KEK. The old KEK is **retained** in the ring to allow reads of objects that were written before the rotation. This is an append-only ring — no keys are deleted during rotation.
+`StorageClient::rotate()` generates a new ML-KEM-768 key pair, adds it to the in-process key ring, promotes it to `active_kek_id_`, and persists the updated ring to disk. New objects written after rotation are wrapped under the new KEK. The old KEK is **retained** in the ring to allow reads of objects that were written before the rotation. This is an append-only ring - no keys are deleted during rotation.
 
 > **Known limitation:** `rotate()` does not re-wrap the DEKs of existing objects under the new KEK. Old objects remain permanently tied to the KEK that was active at their write time. Full re-encryption would require a background sweep over all object metadata, which is deferred to a future milestone.
 
@@ -64,11 +64,11 @@ On `get()`, the code first attempts to decrypt the wrapped DEK using the KEK ID 
 - Post-quantum confidentiality at rest: an adversary who captures all shard nodes and the metadata database cannot decrypt objects without the ML-KEM-768 private key.
 - Per-object DEKs limit blast radius: compromise of one object's DEK does not affect any other object.
 - AAD on shard index provides integrity against cross-shard substitution attacks.
-- Key rotation is non-disruptive to reads — the ring retains all historical KEKs.
+- Key rotation is non-disruptive to reads - the ring retains all historical KEKs.
 - DEK is scrubbed from memory immediately after use.
 
 **Negative / Risks:**
 - The KEK file on disk is the single point of failure for the entire key ring. If it is lost and no backup exists, all objects become unrecoverable. Backup strategy is out of scope for this POC.
-- The default keystore path (`/tmp/pqdos_test_kek.json`) is in a world-accessible directory. The `PQDOS_KEYSTORE_PATH` environment variable must be set in any environment beyond local testing.
+- The default keystore path (`/tmp/pqdos_kek.json`) is in a world-accessible directory. The `PQDOS_KEYSTORE_PATH` environment variable must be set in any environment beyond local testing.
 - Old objects are never re-wrapped after rotation; if the old KEK is later confirmed compromised, those objects remain at risk until manually re-encrypted.
 - `StorageClient` thread safety is now defined by [ADR-0006](0006-concurrency-contract.md): `kek_ring_` and `active_kek_id_` are protected by a `std::shared_mutex`. Concurrent conflicting mutations on the same object ID remain intentionally unordered.

@@ -32,8 +32,12 @@ class StorageNodeServerTest : public ::testing::Test {
 protected:
     httplib::Client client_{testHost(), testPort()};
 
+    static std::string shardUri(const std::string& location) {
+        return "/shards?location=" + location;
+    }
+
     void cleanup(const std::string& location) {
-        (void)client_.Delete("/shards/" + location);
+        (void)client_.Delete(shardUri(location));
     }
 };
 
@@ -52,7 +56,7 @@ TEST_F(StorageNodeServerTest, PutShardReturnsOk) {
     const std::string payload = "hello binary data";
 
     auto res = client_.Put(
-        "/shards/" + location,
+        shardUri(location),
         payload,
         "application/octet-stream"
     );
@@ -71,12 +75,12 @@ TEST_F(StorageNodeServerTest, GetShardReturnsStoredPayload) {
     const std::string payload = "binary shard content";
 
     client_.Put(
-        "/shards/" + location,
+        shardUri(location),
         payload,
         "application/octet-stream"
     );
 
-    auto res = client_.Get("/shards/" + location);
+    auto res = client_.Get(shardUri(location));
 
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 200);
@@ -86,7 +90,7 @@ TEST_F(StorageNodeServerTest, GetShardReturnsStoredPayload) {
 }
 
 TEST_F(StorageNodeServerTest, GetMissingShardReturns404) {
-    auto res = client_.Get("/shards/nonexistent-location");
+    auto res = client_.Get(shardUri("nonexistent-location"));
 
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 404);
@@ -100,12 +104,12 @@ TEST_F(StorageNodeServerTest, DeleteShardReturnsPayload) {
     const std::string payload = "to be deleted";
 
     client_.Put(
-        "/shards/" + location,
+        shardUri(location),
         payload,
         "application/octet-stream"
     );
 
-    auto res = client_.Delete("/shards/" + location);
+    auto res = client_.Delete(shardUri(location));
 
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 200);
@@ -113,7 +117,7 @@ TEST_F(StorageNodeServerTest, DeleteShardReturnsPayload) {
 }
 
 TEST_F(StorageNodeServerTest, DeleteMissingShardReturns404) {
-    auto res = client_.Delete("/shards/nonexistent-delete");
+    auto res = client_.Delete(shardUri("nonexistent-delete"));
 
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 404);
@@ -127,14 +131,14 @@ TEST_F(StorageNodeServerTest, GetAfterDeleteReturns404) {
     const std::string payload = "ephemeral data";
 
     client_.Put(
-        "/shards/" + location,
+        shardUri(location),
         payload,
         "application/octet-stream"
     );
 
-    client_.Delete("/shards/" + location);
+    client_.Delete(shardUri(location));
 
-    auto res = client_.Get("/shards/" + location);
+    auto res = client_.Get(shardUri(location));
 
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 404);
@@ -146,18 +150,18 @@ TEST_F(StorageNodeServerTest, PutOverwritesExistingPayload) {
     const std::string payload2 = "second version";
 
     client_.Put(
-        "/shards/" + location,
+        shardUri(location),
         payload1,
         "application/octet-stream"
     );
 
     client_.Put(
-        "/shards/" + location,
+        shardUri(location),
         payload2,
         "application/octet-stream"
     );
 
-    auto res = client_.Get("/shards/" + location);
+    auto res = client_.Get(shardUri(location));
 
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 200);
@@ -171,12 +175,12 @@ TEST_F(StorageNodeServerTest, PutAndGetBinaryPayloadWithNullBytes) {
     const std::string payload = std::string("\x00\x01\x02\x00\xFF\x10\x00\x7F", 8);
 
     client_.Put(
-        "/shards/" + location,
+        shardUri(location),
         payload,
         "application/octet-stream"
     );
 
-    auto res = client_.Get("/shards/" + location);
+    auto res = client_.Get(shardUri(location));
 
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 200);
@@ -197,12 +201,12 @@ TEST_F(StorageNodeServerTest, PutAndGetSerializedEncryptedShard) {
     const std::string location = "test-serialized-shard";
 
     client_.Put(
-        "/shards/" + location,
+        shardUri(location),
         payload,
         "application/octet-stream"
     );
 
-    auto res = client_.Get("/shards/" + location);
+    auto res = client_.Get(shardUri(location));
 
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 200);
@@ -215,6 +219,30 @@ TEST_F(StorageNodeServerTest, PutAndGetSerializedEncryptedShard) {
     EXPECT_EQ(decoded.ciphertext, shard.ciphertext);
 
     cleanup(location);
+}
+
+TEST_F(StorageNodeServerTest, PutAndGetShardWithStructuredKey) {
+    const std::string location =
+        "00000000-0000-0000-0000-00000000abcd/0123abcd4567ef89/2";
+    const std::string payload = "structured-key-payload";
+
+    auto put_res = client_.Put(
+        shardUri(location),
+        payload,
+        "application/octet-stream"
+    );
+
+    ASSERT_TRUE(put_res);
+    ASSERT_EQ(put_res->status, 200);
+
+    auto get_res = client_.Get(shardUri(location));
+    ASSERT_TRUE(get_res);
+    ASSERT_EQ(get_res->status, 200);
+    EXPECT_EQ(get_res->body, payload);
+
+    auto del_res = client_.Delete(shardUri(location));
+    ASSERT_TRUE(del_res);
+    ASSERT_EQ(del_res->status, 200);
 }
 
 } // namespace

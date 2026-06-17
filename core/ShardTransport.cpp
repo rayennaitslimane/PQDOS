@@ -4,38 +4,13 @@
 
 #include <cstdlib>
 #include <future>
+#include <limits>
+
+#include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
-
-namespace {
-
-std::array<std::string, kNumNodes> parseNodeAddresses() {
-    const char* env = std::getenv("NODE_ADDRESSES");
-    if (!env) {
-        return {"localhost:9001", "localhost:9002", "localhost:9003"};
-    }
-    std::array<std::string, kNumNodes> addresses;
-    std::istringstream stream(env);
-    std::string token;
-    std::size_t i = 0;
-    while (std::getline(stream, token, ',') && i < kNumNodes) {
-        addresses[i++] = token;
-    }
-    if (i != kNumNodes) {
-        throw std::runtime_error(
-            "NODE_ADDRESSES must contain exactly 3 comma-separated addresses"
-        );
-    }
-    return addresses;
-}
-
-} // namespace
-
-const std::array<std::string, kNumNodes>& node_addresses() {
-    static const std::array<std::string, kNumNodes> addresses = parseNodeAddresses();
-    return addresses;
-}
 
 std::pair<std::string, int> parse_address(const std::string& address) {
     const auto pos = address.rfind(':');
@@ -46,32 +21,97 @@ std::pair<std::string, int> parse_address(const std::string& address) {
     return {address.substr(0, pos), std::stoi(address.substr(pos + 1))};
 }
 
-std::string make_shard_location(const std::string& object_id, const std::string& version, uint32_t shard_index) {
-    return object_id + "-" + version + "-" + std::to_string(shard_index);
+namespace {
+
+httplib::Client& get_node_client(const std::string& node_address) {
+    thread_local std::unordered_map<
+        std::string,
+        std::unique_ptr<httplib::Client>
+    > clients;
+
+    auto it = clients.find(node_address);
+
+    if (it == clients.end()) {
+        auto [host, port] = parse_address(node_address);
+
+        auto client = std::make_unique<httplib::Client>(host, port);
+        client->set_connection_timeout(5, 0);
+        client->set_read_timeout(10, 0);
+
+        auto [inserted_it, _] = clients.emplace(
+            node_address,
+            std::move(client)
+        );
+
+        return *inserted_it->second;
+    }
+
+    return *it->second;
 }
 
-// MVP placement strategy:
-// - one shard per node
-// - shard i goes to node i
+} // namespace
+
+std::string make_shard_key(const std::string& object_id, const std::string& version, uint32_t shard_index) {
+    if (object_id.empty() || version.empty()) {
+        throw std::invalid_argument("make_shard_key: object_id and version must be non-empty");
+    }
+
+    if (object_id.find('/') != std::string::npos || version.find('/') != std::string::npos) {
+        throw std::invalid_argument("make_shard_key: object_id/version must not contain '/'");
+    }
+
+    return object_id + "/" + version + "/" + std::to_string(shard_index);
+}
+
+ParsedShardKey parse_shard_key(const std::string& location) {
+    const auto first = location.find('/');
+    const auto second = (first == std::string::npos) ? std::string::npos : location.find('/', first + 1);
+
+    if (first == std::string::npos || second == std::string::npos ||
+        location.find('/', second + 1) != std::string::npos) {
+        throw std::runtime_error("parse_shard_key: invalid key format");
+    }
+
+    ParsedShardKey parsed;
+    parsed.object_id = location.substr(0, first);
+    parsed.version = location.substr(first + 1, second - first - 1);
+
+    if (parsed.object_id.empty() || parsed.version.empty() || second + 1 >= location.size()) {
+        throw std::runtime_error("parse_shard_key: invalid key format");
+    }
+
+    try {
+        const std::size_t idx = std::stoul(location.substr(second + 1));
+        if (idx > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::runtime_error("parse_shard_key: shard index out of range");
+        }
+        parsed.shard_index = static_cast<uint32_t>(idx);
+    } catch (const std::exception&) {
+        throw std::runtime_error("parse_shard_key: invalid shard index");
+    }
+
+    return parsed;
+}
+
 PlacementMap placement_strategy(
     const std::string& object_id,
     const std::string& version,
-    const std::vector<Bytes>& serialized_shards
+    const std::vector<Bytes>& serialized_shards,
+    const std::vector<std::string>& eligible_nodes
 ) {
-    const auto& addresses = node_addresses();
     const std::size_t total_shards = serialized_shards.size();
 
-    if (total_shards > addresses.size()) {
+    if (total_shards > eligible_nodes.size()) {
         throw std::runtime_error(
-            "placement_strategy: not enough nodes for number of shards"
+            "placement_strategy: not enough eligible nodes for number of shards"
         );
     }
 
     PlacementMap placement;
 
     for (std::size_t i = 0; i < total_shards; ++i) {
-        const std::string& node_address = addresses[i];
-        const std::string location = make_shard_location(
+        const std::string& node_address = eligible_nodes[i];
+        const std::string location = make_shard_key(
             object_id,
             version,
             static_cast<uint32_t>(i)
@@ -88,13 +128,12 @@ void apply_placement(const PlacementMap& placement) {
 
     for (const auto& [node_address, entries] : placement) {
         futures.push_back(std::async(std::launch::async,
-            [&node_address, &entries]() {
-                auto [host, port] = parse_address(node_address);
-                httplib::Client client(host, port);
+            [node_address, &entries]() {
+                auto& client = get_node_client(node_address);
 
                 for (const auto& [location, payload] : entries) {
                     auto res = client.Put(
-                        "/shards/" + location,
+                        "/shards?location=" + location,
                         reinterpret_cast<const char*>(payload.data()),
                         payload.size(),
                         "application/octet-stream"
@@ -103,7 +142,7 @@ void apply_placement(const PlacementMap& placement) {
                     if (!res || res->status != 200) {
                         throw std::runtime_error(
                             "apply_placement: failed to PUT shard to " +
-                            node_address + "/shards/" + location
+                            node_address + "/shards?location=" + location
                         );
                     }
                 }
@@ -116,8 +155,6 @@ void apply_placement(const PlacementMap& placement) {
     }
 }
 
-// Build metadata.shard_locations as an ordered vector of "host:port/location".
-// The index in the vector equals the shard index.
 std::vector<std::string> build_shard_locations(const PlacementMap& placement) {
     std::size_t total_shards = 0;
     for (const auto& [node_address, entries] : placement) {
@@ -128,13 +165,8 @@ std::vector<std::string> build_shard_locations(const PlacementMap& placement) {
 
     for (const auto& [node_address, entries] : placement) {
         for (const auto& [location, payload] : entries) {
-            const auto pos = location.rfind('-');
-            if (pos == std::string::npos) {
-                throw std::runtime_error("build_shard_locations: invalid location");
-            }
-
-            const std::size_t shard_index = std::stoul(location.substr(pos + 1));
-            shard_locations.at(shard_index) = node_address + "/" + location;
+            const ParsedShardKey parsed = parse_shard_key(location);
+            shard_locations.at(parsed.shard_index) = node_address + "/" + location;
         }
     }
 
@@ -150,6 +182,8 @@ ShardLocationMap parse_shard_locations(const std::vector<std::string>& shard_loc
             throw std::runtime_error("parse_shard_locations: invalid shard location");
         }
 
+        // Invariant: first slash splits node address from shard key. Remaining
+        // slashes belong to the shard key format object_id/version/shard_index.
         const std::string node_address = shard_location.substr(0, pos);
         const std::string location = shard_location.substr(pos + 1);
 
@@ -166,24 +200,23 @@ std::vector<EncryptedShard> fetch_encrypted_shards(
 
     for (const auto& [node_address, locations] : shard_location_map) {
         futures.push_back(std::async(std::launch::async,
-            [&node_address, &locations]() -> std::vector<EncryptedShard> {
+            [node_address, &locations]() -> std::vector<EncryptedShard> {
                 std::vector<EncryptedShard> shards;
 
-                std::pair<std::string, int> addr;
+                httplib::Client* client_ptr;
                 try {
-                    addr = parse_address(node_address);
+                    client_ptr = &get_node_client(node_address);
                 } catch (...) {
                     return shards;
                 }
-
-                httplib::Client client(addr.first, addr.second);
+                auto& client = *client_ptr;
 
                 for (const auto& location : locations) {
                     try {
-                        auto res = client.Get("/shards/" + location);
+                        auto res = client.Get("/shards?location=" + location);
 
                         if (!res || res->status != 200) {
-                            continue; // missing shard
+                            continue;
                         }
 
                         Bytes payload(res->body.begin(), res->body.end());
@@ -193,11 +226,9 @@ std::vector<EncryptedShard> fetch_encrypted_shards(
                                 EncryptedShard::deserialize(payload)
                             );
                         } catch (...) {
-                            // malformed/corrupt serialized shard -> ignore
                             continue;
                         }
                     } catch (...) {
-                        // node unavailable
                         continue;
                     }
                 }
@@ -225,21 +256,19 @@ void remove_from_nodes(const ShardLocationMap& shard_location_map) {
 
     for (const auto& [node_address, locations] : shard_location_map) {
         futures.push_back(std::async(std::launch::async,
-            [&node_address, &locations]() {
-                std::pair<std::string, int> addr;
+            [node_address, &locations]() {
+                httplib::Client* client_ptr;
                 try {
-                    addr = parse_address(node_address);
+                    client_ptr = &get_node_client(node_address);
                 } catch (...) {
                     return;
                 }
-
-                httplib::Client client(addr.first, addr.second);
+                auto& client = *client_ptr;
 
                 for (const auto& location : locations) {
                     try {
-                        (void)client.Delete("/shards/" + location);
+                        (void)client.Delete("/shards?location=" + location);
                     } catch (...) {
-                        // Ignore missing node / already-deleted shard / backend failure
                         continue;
                     }
                 }
@@ -253,5 +282,19 @@ void remove_from_nodes(const ShardLocationMap& shard_location_map) {
         } catch (...) {
             // best-effort deletion
         }
+    }
+}
+
+bool probe_shard(const std::string& node_address, const std::string& location) {
+    try {
+        auto [host, port] = parse_address(node_address);
+        httplib::Client client(host, port);
+        client.set_connection_timeout(5, 0);
+        client.set_read_timeout(10, 0);
+
+        auto res = client.Get("/shards?location=" + location);
+        return res && res->status == 200;
+    } catch (...) {
+        return false;
     }
 }

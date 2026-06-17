@@ -24,7 +24,8 @@ void MetadataStore::init_schema() {
             checksum TEXT NOT NULL,
             erasure_spec BYTEA NOT NULL,
             encrypted_dek BYTEA NOT NULL,
-            kek_id TEXT NOT NULL
+            kek_id TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1
         );
     )SQL");
 
@@ -40,6 +41,14 @@ void MetadataStore::init_schema() {
     tx.exec(R"SQL(
         CREATE INDEX IF NOT EXISTS idx_object_shard_locations_object_id
         ON object_shard_locations(object_id);
+    )SQL");
+
+    tx.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS nodes (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            address TEXT NOT NULL UNIQUE,
+            registered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
     )SQL");
 
     tx.commit();
@@ -170,6 +179,110 @@ std::vector<ObjectMetadata> MetadataStore::list() {
     return objects;
 }
 
+bool MetadataStore::conditional_put(const ObjectMetadata& metadata, int expected_version) {
+    std::lock_guard<std::mutex> lock(mu_);
+    validate_metadata(metadata);
+
+    pqxx::work tx{conn_};
+
+    const std::int64_t object_size = checked_size_to_i64(metadata.size);
+    const Bytes erasure_bytes = metadata.erasure.serialize();
+
+    pqxx::bytes erasure_blob;
+    erasure_blob.reserve(erasure_bytes.size());
+    for (const auto byte : erasure_bytes) {
+        erasure_blob.push_back(static_cast<std::byte>(byte));
+    }
+
+    pqxx::bytes encrypted_dek_blob;
+    encrypted_dek_blob.reserve(metadata.encrypted_dek.size());
+    for (const auto byte : metadata.encrypted_dek) {
+        encrypted_dek_blob.push_back(static_cast<std::byte>(byte));
+    }
+
+    pqxx::result result = tx.exec(
+        pqxx::prepped{"conditional_put_object_metadata"},
+        pqxx::params{
+            metadata.id,
+            object_size,
+            metadata.checksum,
+            erasure_blob,
+            encrypted_dek_blob,
+            metadata.kek_id,
+            expected_version
+        }
+    );
+
+    if (result.affected_rows() == 0) {
+        tx.commit();
+        return false;
+    }
+
+    // Replace shard locations atomically.
+    tx.exec(
+        pqxx::prepped{"delete_object_shard_locations"},
+        pqxx::params{metadata.id}
+    );
+
+    for (std::size_t i = 0; i < metadata.shard_locations.size(); ++i) {
+        tx.exec(
+            pqxx::prepped{"insert_object_shard_location"},
+            pqxx::params{
+                metadata.id,
+                static_cast<std::int32_t>(i),
+                metadata.shard_locations[i]
+            }
+        );
+    }
+
+    tx.commit();
+    return true;
+}
+
+void MetadataStore::register_node(const std::string& address) {
+    std::lock_guard<std::mutex> lock(mu_);
+    pqxx::work tx{conn_};
+
+    tx.exec(
+        pqxx::prepped{"register_node"},
+        pqxx::params{address}
+    );
+
+    tx.commit();
+}
+
+bool MetadataStore::unregister_node(const std::string& address) {
+    std::lock_guard<std::mutex> lock(mu_);
+    pqxx::work tx{conn_};
+
+    pqxx::result result = tx.exec(
+        pqxx::prepped{"unregister_node"},
+        pqxx::params{address}
+    );
+
+    tx.commit();
+    return result.affected_rows() > 0;
+}
+
+std::vector<std::string> MetadataStore::list_nodes() {
+    std::lock_guard<std::mutex> lock(mu_);
+    pqxx::read_transaction tx{conn_};
+
+    pqxx::result rows = tx.exec(
+        pqxx::prepped{"list_nodes"},
+        pqxx::params{}
+    );
+
+    std::vector<std::string> addresses;
+    addresses.reserve(rows.size());
+
+    for (const auto& row : rows) {
+        addresses.push_back(row["address"].c_str());
+    }
+
+    return addresses;
+}
+
 void MetadataStore::prepare_statements() {
     conn_.prepare(
         "put_object_metadata",
@@ -180,7 +293,8 @@ void MetadataStore::prepare_statements() {
                 checksum,
                 erasure_spec,
                 encrypted_dek,
-                kek_id
+                kek_id,
+                version
             )
             VALUES (
                 $1::uuid,
@@ -188,7 +302,8 @@ void MetadataStore::prepare_statements() {
                 $3,
                 $4::bytea,
                 $5::bytea,
-                $6
+                $6,
+                1
             )
             ON CONFLICT (id) DO UPDATE
             SET
@@ -196,7 +311,24 @@ void MetadataStore::prepare_statements() {
                 checksum = EXCLUDED.checksum,
                 erasure_spec = EXCLUDED.erasure_spec,
                 encrypted_dek = EXCLUDED.encrypted_dek,
-                kek_id = EXCLUDED.kek_id
+                kek_id = EXCLUDED.kek_id,
+                version = object_metadata.version + 1
+            RETURNING version
+        )SQL"
+    );
+
+    conn_.prepare(
+        "conditional_put_object_metadata",
+        R"SQL(
+            UPDATE object_metadata
+            SET
+                size = $2,
+                checksum = $3,
+                erasure_spec = $4::bytea,
+                encrypted_dek = $5::bytea,
+                kek_id = $6,
+                version = version + 1
+            WHERE id = $1::uuid AND version = $7
         )SQL"
     );
 
@@ -233,7 +365,8 @@ void MetadataStore::prepare_statements() {
                 checksum,
                 erasure_spec,
                 encrypted_dek,
-                kek_id
+                kek_id,
+                version
             FROM object_metadata
             WHERE id = $1::uuid
         )SQL"
@@ -266,9 +399,36 @@ void MetadataStore::prepare_statements() {
                 checksum,
                 erasure_spec,
                 encrypted_dek,
-                kek_id
+                kek_id,
+                version
             FROM object_metadata
             ORDER BY id ASC
+        )SQL"
+    );
+
+    conn_.prepare(
+        "register_node",
+        R"SQL(
+            INSERT INTO nodes (address)
+            VALUES ($1)
+            ON CONFLICT (address) DO NOTHING
+        )SQL"
+    );
+
+    conn_.prepare(
+        "unregister_node",
+        R"SQL(
+            DELETE FROM nodes
+            WHERE address = $1
+        )SQL"
+    );
+
+    conn_.prepare(
+        "list_nodes",
+        R"SQL(
+            SELECT address
+            FROM nodes
+            ORDER BY registered_at ASC
         )SQL"
     );
 }
@@ -305,6 +465,7 @@ ObjectMetadata MetadataStore::row_to_object_metadata(const pqxx::row_ref& row) {
     }
 
     metadata.kek_id = row["kek_id"].c_str();
+    metadata.version = row["version"].as<int>();
 
     return metadata;
 }

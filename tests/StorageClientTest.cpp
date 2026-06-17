@@ -71,7 +71,7 @@ protected:
         connStr_ = testConnectionString();
 
         // Use a temp keystore file per test
-        kek_path_ = "/tmp/pqdos_test_kek_" +
+        kek_path_ = "/tmp/pqdos_kek_" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
             ".json";
         setenv("PQDOS_KEYSTORE_PATH", kek_path_.c_str(), 1);
@@ -79,6 +79,12 @@ protected:
         clearDatabase();
 
         client_ = std::make_unique<StorageClient>(connStr_);
+
+        // Register test nodes
+        client_->metadata_store().register_node("localhost:9001");
+        client_->metadata_store().register_node("localhost:9002");
+        client_->metadata_store().register_node("localhost:9003");
+
         client_->init();
     }
 
@@ -96,7 +102,8 @@ protected:
         tx.exec(R"SQL(
             TRUNCATE TABLE
                 object_shard_locations,
-                object_metadata
+                object_metadata,
+                nodes
             RESTART IDENTITY
             CASCADE
         )SQL");
@@ -250,7 +257,7 @@ struct MultiClientEnv {
 };
 
 // ---------------------------------------------------------------------------
-// T1: Race conditions — repeated PUT/GET under load
+// T1: Race conditions - repeated PUT/GET under load
 // ---------------------------------------------------------------------------
 TEST_F(StorageClientTest, ConcurrentWriteReadRoundTrip) {
     constexpr int kNumClients = 8;
@@ -294,7 +301,7 @@ TEST_F(StorageClientTest, ConcurrentWriteReadRoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
-// T2: Partial failure — missing/unavailable node (shard deleted)
+// T2: Partial failure - missing/unavailable node (shard deleted)
 // ---------------------------------------------------------------------------
 TEST_F(StorageClientTest, GetSucceedsWithOneShardDeleted) {
     const std::string object_id = "00000000-0000-0000-0000-000000000410";
@@ -307,26 +314,26 @@ TEST_F(StorageClientTest, GetSucceedsWithOneShardDeleted) {
     const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
     ASSERT_NE(meta, nullptr);
     ASSERT_GE(meta->shard_locations.size(), 1u);
-    // shard_locations[0] is "host:port/location" — extract path after '/'
+    // shard_locations[0] is "host:port/location" - extract path after '/'
     const std::string& loc0 = meta->shard_locations[0];
     const std::string shard_path = loc0.substr(loc0.find('/') + 1);
 
     // Directly delete shard 0 from node on port 9001
     {
         httplib::Client node0("localhost", 9001);
-        auto res = node0.Delete("/shards/" + shard_path);
+        auto res = node0.Delete("/shards?location=" + shard_path);
         ASSERT_TRUE(res);
         ASSERT_EQ(res->status, 200);
     }
 
-    // GET must still succeed — k=2 shards from nodes 9002 and 9003 suffice
+    // GET must still succeed - k=2 shards from nodes 9002 and 9003 suffice
     Bytes restored;
     ASSERT_NO_THROW(restored = client().get(object_id));
     EXPECT_EQ(ToString(restored), original);
 }
 
 // ---------------------------------------------------------------------------
-// T3: Aggregation bugs — large payload (max size) reconstruction
+// T3: Aggregation bugs - large payload (max size) reconstruction
 // ---------------------------------------------------------------------------
 TEST_F(StorageClientTest, ConcurrentMaxSizePayloadFidelity) {
     constexpr int kNumClients = 6;
@@ -394,7 +401,7 @@ TEST_F(StorageClientTest, ConcurrentMaxSizePayloadFidelity) {
 }
 
 // ---------------------------------------------------------------------------
-// T4: DB consistency — many objects written/read concurrently
+// T4: DB consistency - many objects written/read concurrently
 // ---------------------------------------------------------------------------
 TEST_F(StorageClientTest, HighVolumeWriteListConsistency) {
     constexpr int kNumClients = 4;
@@ -473,7 +480,7 @@ TEST_F(StorageClientTest, HighVolumeWriteListConsistency) {
 }
 
 // ---------------------------------------------------------------------------
-// T5: Timing / non-blocking I/O — slow node does not block fast nodes
+// T5: Timing / non-blocking I/O - slow node does not block fast nodes
 // ---------------------------------------------------------------------------
 TEST_F(StorageClientTest, GetCompletesWithMissingShardInBoundedTime) {
     const std::string object_id = "00000000-0000-0000-0000-000000000430";
@@ -486,19 +493,19 @@ TEST_F(StorageClientTest, GetCompletesWithMissingShardInBoundedTime) {
     const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
     ASSERT_NE(meta, nullptr);
     ASSERT_GE(meta->shard_locations.size(), 3u);
-    // shard_locations[2] is "host:port/location" — extract path after '/'
+    // shard_locations[2] is "host:port/location" - extract path after '/'
     const std::string& loc2 = meta->shard_locations[2];
     const std::string shard_path = loc2.substr(loc2.find('/') + 1);
 
-    // Delete shard 2 from node on port 9003 — simulates unavailable shard
+    // Delete shard 2 from node on port 9003 - simulates unavailable shard
     {
         httplib::Client node2("localhost", 9003);
-        auto res = node2.Delete("/shards/" + shard_path);
+        auto res = node2.Delete("/shards?location=" + shard_path);
         ASSERT_TRUE(res);
         ASSERT_EQ(res->status, 200);
     }
 
-    // Time the GET — parallel fetch should not be blocked by the missing shard
+    // Time the GET - parallel fetch should not be blocked by the missing shard
     auto start = std::chrono::steady_clock::now();
     Bytes restored;
     ASSERT_NO_THROW(restored = client().get(object_id));
@@ -510,11 +517,11 @@ TEST_F(StorageClientTest, GetCompletesWithMissingShardInBoundedTime) {
     // Timing: must complete well under 3 seconds on loopback.
     // A sequential implementation with per-node timeouts would exceed this.
     EXPECT_LT(elapsed, std::chrono::seconds(3))
-        << "GET took too long — parallel dispatch may be broken";
+        << "GET took too long - parallel dispatch may be broken";
 }
 
 // ---------------------------------------------------------------------------
-// T6: Race conditions + aggregation — concurrent overwrite same object
+// T6: Race conditions + aggregation - concurrent overwrite same object
 // ---------------------------------------------------------------------------
 TEST_F(StorageClientTest, ConcurrentOverwriteSameObjectYieldsConsistentState) {
     constexpr int kNumClients = 4;
@@ -549,11 +556,11 @@ TEST_F(StorageClientTest, ConcurrentOverwriteSameObjectYieldsConsistentState) {
 
     // The system must reach a consistent readable state.
     // If metadata from client A is stored but shards from client B won the
-    // LMDB write race, the DEK will not decrypt correctly — this surfaces
+    // LMDB write race, the DEK will not decrypt correctly - this surfaces
     // the known atomicity gap (ADR-0004 / ADR-0005).
     Bytes result;
     ASSERT_NO_THROW(result = client().get(shared_id))
-        << "GET threw — possible shard/metadata atomicity mismatch";
+        << "GET threw - possible shard/metadata atomicity mismatch";
 
     // The result must be exactly one of the four candidates (no garbled mix)
     const std::string result_str = ToString(result);
@@ -754,7 +761,7 @@ TEST_F(StorageClientTest, ThreadSanitizerCleanRun) {
                 }
             }
         } catch (const std::exception&) {
-            // get() after remove() may throw "not found" — that's expected
+            // get() after remove() may throw "not found" - that's expected
         }
     };
 
@@ -769,6 +776,230 @@ TEST_F(StorageClientTest, ThreadSanitizerCleanRun) {
     // The primary assertion is that we reach here without TSAN reports,
     // crashes, or deadlocks. The error counter guards against silent corruption.
     EXPECT_EQ(errors.load(), 0);
+}
+
+// ===========================================================================
+// Health and Repair tests
+// ===========================================================================
+
+TEST_F(StorageClientTest, HealthReportsFullyReplicatedAfterPut) {
+    const std::string object_id = "00000000-0000-0000-0000-000000005001";
+    client().put(object_id, ToBytes("health-check-payload"), TestErasureSpec());
+
+    ObjectHealth h = client().health(object_id);
+
+    EXPECT_EQ(h.object_id, object_id);
+    EXPECT_EQ(h.total_shards, 3u);
+    EXPECT_EQ(h.required_shards, 2u);
+    EXPECT_EQ(h.available_shards, 3u);
+    EXPECT_TRUE(h.healthy);
+    EXPECT_TRUE(h.fully_replicated);
+    EXPECT_TRUE(h.missing_indices.empty());
+}
+
+TEST_F(StorageClientTest, HealthReportsDegradedAfterShardLoss) {
+    const std::string object_id = "00000000-0000-0000-0000-000000005002";
+    client().put(object_id, ToBytes("degraded-health-test"), TestErasureSpec());
+
+    // Delete shard 0 from node 9001
+    const auto items = client().list();
+    const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
+    ASSERT_NE(meta, nullptr);
+    ASSERT_GE(meta->shard_locations.size(), 1u);
+
+    const std::string& loc0 = meta->shard_locations[0];
+    const std::string shard_path = loc0.substr(loc0.find('/') + 1);
+
+    {
+        httplib::Client node0("localhost", 9001);
+        auto res = node0.Delete("/shards?location=" + shard_path);
+        ASSERT_TRUE(res);
+        ASSERT_EQ(res->status, 200);
+    }
+
+    ObjectHealth h = client().health(object_id);
+
+    EXPECT_EQ(h.available_shards, 2u);
+    EXPECT_TRUE(h.healthy);         // still readable (k=2 available)
+    EXPECT_FALSE(h.fully_replicated);
+    ASSERT_EQ(h.missing_indices.size(), 1u);
+    EXPECT_EQ(h.missing_indices[0], 0u);
+}
+
+TEST_F(StorageClientTest, HealthThrowsForMissingObject) {
+    EXPECT_THROW(
+        client().health("00000000-0000-0000-0000-ffffffffffff"),
+        std::runtime_error
+    );
+}
+
+TEST_F(StorageClientTest, RepairRestoresMissingShard) {
+    const std::string object_id = "00000000-0000-0000-0000-000000005003";
+    const std::string payload = "repair-test-payload!";
+    client().put(object_id, ToBytes(payload), TestErasureSpec());
+
+    // Delete shard 0
+    const auto items = client().list();
+    const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
+    ASSERT_NE(meta, nullptr);
+
+    const std::string& loc0 = meta->shard_locations[0];
+    const std::string shard_path = loc0.substr(loc0.find('/') + 1);
+
+    {
+        httplib::Client node0("localhost", 9001);
+        auto res = node0.Delete("/shards?location=" + shard_path);
+        ASSERT_TRUE(res);
+        ASSERT_EQ(res->status, 200);
+    }
+
+    // Verify degraded
+    ObjectHealth h_before = client().health(object_id);
+    ASSERT_FALSE(h_before.fully_replicated);
+
+    // Repair
+    bool repaired = client().repair(object_id);
+    EXPECT_TRUE(repaired);
+
+    // Verify fully replicated after repair
+    ObjectHealth h_after = client().health(object_id);
+    EXPECT_TRUE(h_after.fully_replicated);
+    EXPECT_EQ(h_after.available_shards, 3u);
+    EXPECT_TRUE(h_after.missing_indices.empty());
+
+    // Data still readable and correct
+    Bytes restored = client().get(object_id);
+    EXPECT_EQ(ToString(restored), payload);
+}
+
+TEST_F(StorageClientTest, RepairReturnsTrueWhenNothingToRepair) {
+    const std::string object_id = "00000000-0000-0000-0000-000000005004";
+    client().put(object_id, ToBytes("already-healthy-data"), TestErasureSpec());
+
+    bool repaired = client().repair(object_id);
+    EXPECT_TRUE(repaired);
+}
+
+TEST_F(StorageClientTest, RepairThrowsWhenTooFewShardsRemain) {
+    const std::string object_id = "00000000-0000-0000-0000-000000005005";
+    client().put(object_id, ToBytes("unrecoverable-test!!"), TestErasureSpec());
+
+    // Delete 2 of 3 shards (need k=2 to reconstruct, only 1 remains)
+    const auto items = client().list();
+    const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
+    ASSERT_NE(meta, nullptr);
+    ASSERT_EQ(meta->shard_locations.size(), 3u);
+
+    for (int i = 0; i < 2; ++i) {
+        const std::string& loc = meta->shard_locations[i];
+        const auto slash = loc.find('/');
+        const std::string node_addr = loc.substr(0, slash);
+        const std::string shard_path = loc.substr(slash + 1);
+
+        auto [host, port] = std::pair{
+            node_addr.substr(0, node_addr.rfind(':')),
+            std::stoi(node_addr.substr(node_addr.rfind(':') + 1))
+        };
+
+        httplib::Client node(host, port);
+        auto res = node.Delete("/shards?location=" + shard_path);
+        ASSERT_TRUE(res);
+    }
+
+    EXPECT_THROW(client().repair(object_id), std::runtime_error);
+}
+
+TEST_F(StorageClientTest, RepairSkipsDownButRegisteredNodes) {
+    const std::string object_id = "00000000-0000-0000-0000-000000005006";
+    const std::string payload = "repair-skip-down-registered";
+    client().put(object_id, ToBytes(payload), TestErasureSpec());
+
+    // Delete shard 0 from node 9001 so repair has one missing shard.
+    const auto items = client().list();
+    const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
+    ASSERT_NE(meta, nullptr);
+    ASSERT_EQ(meta->shard_locations.size(), 3u);
+
+    const std::string& loc0 = meta->shard_locations[0];
+    const std::string shard_path = loc0.substr(loc0.find('/') + 1);
+
+    {
+        httplib::Client node0("localhost", 9001);
+        auto res = node0.Delete("/shards?location=" + shard_path);
+        ASSERT_TRUE(res);
+        ASSERT_EQ(res->status, 200);
+    }
+
+    ObjectHealth h_before = client().health(object_id);
+    ASSERT_FALSE(h_before.fully_replicated);
+
+    // Keep one down-but-registered node in the registry and remove 9001
+    // to force repair candidate selection to include a dead endpoint if
+    // health filtering is missing.
+    EXPECT_TRUE(client().metadata_store().unregister_node("localhost:9001"));
+    client().metadata_store().register_node("localhost:9199");
+
+    bool repaired = false;
+    EXPECT_NO_THROW(repaired = client().repair(object_id));
+    EXPECT_TRUE(repaired);
+
+    ObjectHealth h_after = client().health(object_id);
+    EXPECT_TRUE(h_after.fully_replicated);
+    EXPECT_EQ(h_after.available_shards, 3u);
+
+    Bytes restored = client().get(object_id);
+    EXPECT_EQ(ToString(restored), payload);
+}
+
+// ===========================================================================
+// Validation tests for put() admission checks
+// ===========================================================================
+
+TEST_F(StorageClientTest, PutRejectsZeroDataShards) {
+    ErasureSpec spec = TestErasureSpec();
+    spec.data_shards = 0;
+    EXPECT_THROW(
+        client().put("00000000-0000-0000-0000-000000006001", ToBytes("data"), spec),
+        std::invalid_argument
+    );
+}
+
+TEST_F(StorageClientTest, PutRejectsZeroParityShards) {
+    ErasureSpec spec = TestErasureSpec();
+    spec.parity_shards = 0;
+    EXPECT_THROW(
+        client().put("00000000-0000-0000-0000-000000006002", ToBytes("data"), spec),
+        std::invalid_argument
+    );
+}
+
+TEST_F(StorageClientTest, PutRejectsKPlusMOver255) {
+    ErasureSpec spec;
+    spec.data_shards = 200;
+    spec.parity_shards = 56;
+    spec.shard_size = 20;
+    EXPECT_THROW(
+        client().put("00000000-0000-0000-0000-000000006003", ToBytes("data"), spec),
+        std::invalid_argument
+    );
+}
+
+TEST_F(StorageClientTest, PutRejectsZeroShardSize) {
+    ErasureSpec spec = TestErasureSpec();
+    spec.shard_size = 0;
+    EXPECT_THROW(
+        client().put("00000000-0000-0000-0000-000000006004", ToBytes("data"), spec),
+        std::invalid_argument
+    );
+}
+
+TEST_F(StorageClientTest, PutRejectsPayloadExceedingKTimesShardSize) {
+    ErasureSpec spec = TestErasureSpec(); // k=2, shard_size=20 → max 40 bytes
+    Bytes oversized(41, 'x');
+    EXPECT_THROW(
+        client().put("00000000-0000-0000-0000-000000006005", oversized, spec),
+        std::invalid_argument
+    );
 }
 
 }  // namespace

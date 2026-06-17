@@ -48,6 +48,7 @@ struct ObjectMetadata {
     std::vector<std::string> shard_locations;
     Bytes encrypted_dek;
     std::string kek_id;
+    int version = 0;
 };
 
 struct PlainShard {
@@ -88,4 +89,14 @@ struct EncryptedShard {
         handle.get().convert(result);
         return result;
     }
+};
+
+struct ObjectHealth {
+    std::string object_id;
+    uint32_t total_shards = 0;
+    uint32_t available_shards = 0;
+    uint32_t required_shards = 0;
+    std::vector<uint32_t> missing_indices;
+    bool healthy = false;
+    bool fully_replicated = false;
 };

@@ -33,8 +33,10 @@ void StorageNodeServer::setup_routes() {
         res.set_content(body.dump(), "application/json");
     });
 
-    server_.Put("/shards/:location", [this](const httplib::Request& req, httplib::Response& res) {
-        const std::string location = req.path_params.at("location");
+    server_.Put("/shards", [this](const httplib::Request& req, httplib::Response& res) {
+        const std::string location = req.has_param("location")
+            ? req.get_param_value("location")
+            : "";
 
         if (location.empty()) {
             nlohmann::json body;
@@ -61,8 +63,10 @@ void StorageNodeServer::setup_routes() {
         res.set_content(body.dump(), "application/json");
     });
 
-    server_.Get("/shards/:location", [this](const httplib::Request& req, httplib::Response& res) {
-        const std::string location = req.path_params.at("location");
+    server_.Get("/shards", [this](const httplib::Request& req, httplib::Response& res) {
+        const std::string location = req.has_param("location")
+            ? req.get_param_value("location")
+            : "";
 
         if (location.empty()) {
             nlohmann::json body;
@@ -99,8 +103,10 @@ void StorageNodeServer::setup_routes() {
         );
     });
 
-    server_.Delete("/shards/:location", [this](const httplib::Request& req, httplib::Response& res) {
-        const std::string location = req.path_params.at("location");
+    server_.Delete("/shards", [this](const httplib::Request& req, httplib::Response& res) {
+        const std::string location = req.has_param("location")
+            ? req.get_param_value("location")
+            : "";
 
         if (location.empty()) {
             nlohmann::json body;

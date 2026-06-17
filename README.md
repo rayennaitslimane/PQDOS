@@ -3,7 +3,45 @@
 
 PQDOS is a C++20 distributed object store designed for a zero-trust model, using ML-KEM-768 for post-quantum key wrapping, AES-256-GCM for data encryption, and ISA-L Reed-Solomon erasure coding for fault tolerance. It stores encrypted shards and metadata in separate backends and exposes a simple HTTP API for reliable object storage and retrieval.
 
-## I. Prerequisites
+Today’s storage encryption still depends on RSA and elliptic-curve cryptography which a capable quantum computer could eventually break. PQDOS explores an alternative aspiring to distributed RAIN (Redundant Array of Independant Nodes) principles and integrating a layer of post-quantum security.
+
+
+## I. Architecture Overview
+
+Mermaid diagram for runtime wiring and boundaries:
+
+```
+[API Consumer]
+      |
+      v
+[StorageClientServer :8080]
+      |
+      v
+[StorageClient]
+      │
+      ├── ErasureCodec (ISA-L RS)
+      ├── Crypto (AES-256-GCM + ML-KEM-768)
+      ├── ShardTransport
+      │         ├── Node :9001 -> StorageNode -> LMDB1
+      │         ├── Node :9002 -> StorageNode -> LMDB2
+      │         └── Node :9003 -> StorageNode -> LMDB3
+      └── MetadataStore -> PostgreSQL
+```
+
+Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
+
+| ADR | Decision |
+|-----|----------|
+| [0001](docs/adr/0001-quantum-encryption.md) | ML-KEM-768 KEM-based KEK ring + AES-256-GCM per-object DEK with shard-index AAD |
+| [0002](docs/adr/0002-erasure-codec.md) | ISA-L Reed-Solomon erasure coding with per-object `k`/`m`/`shard_size` |
+| [0003](docs/adr/0003-dual-storage.md) | LMDB for shard payloads, PostgreSQL for object metadata |
+| [0004](docs/adr/0004-shard-transport.md) | Parallel HTTP shard dispatch with dynamic placement and thread-local per-node client reuse |
+| [0005](docs/adr/0005-http-surface.md) | cpp-httplib embedded HTTP server with Base64 object payloads and JSON erasure parameters |
+| [0006](docs/adr/0006-concurrency-contract.md) | Concurrency contract: MetadataStore mutex, KEK ring shared_mutex, tolerated per-object races |
+| [0007](docs/adr/0007-metrics-collector.md) | Inline metrics instrumentation with ScopedTimer, CSV export, benchmark harness |
+
+
+## II. Prerequisites
 
 - Linux
 - GCC >= 11 or Clang >= 14 (C++20)
@@ -13,7 +51,7 @@ PQDOS is a C++20 distributed object store designed for a zero-trust model, using
 - Docker
 
 
-## II. Building
+## III. Building
 
 ```bash
 # Build for the first time
@@ -26,7 +64,7 @@ PQDOS is a C++20 distributed object store designed for a zero-trust model, using
 ./scripts/build.sh reset
 ```
 
-## III. Testing
+## IV. Testing
 
 ### Unit Tests
 
@@ -59,7 +97,7 @@ Services exposed on the host:
 | Storage Node 3 | `localhost:9003` |
 | PostgreSQL | `localhost:5433` |
 
-## IV. Client API
+## V. Client API
 
 ### Store an object
 
@@ -99,38 +137,32 @@ curl http://localhost:8080/objects
 # [{"id":"00000000-0000-0000-0000-000000000001","size":11,"checksum":"b94d27b9..."}]
 ```
 
-## V. Architecture Overview
+### Inspect object health
 
-Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
-
-| ADR | Decision |
-|-----|----------|
-| [0001](docs/adr/0001-quantum-encryption.md) | ML-KEM-768 KEM-based KEK ring + AES-256-GCM per-object DEK with shard-index AAD |
-| [0002](docs/adr/0002-erasure-codec.md) | ISA-L Reed-Solomon erasure coding with per-object `k`/`m`/`shard_size` |
-| [0003](docs/adr/0003-dual-storage.md) | LMDB for shard payloads, PostgreSQL for object metadata |
-| [0004](docs/adr/0004-shard-transport.md) | Parallel HTTP shard dispatch using std::async with index-based placement |
-| [0005](docs/adr/0005-http-surface.md) | cpp-httplib embedded HTTP server with Base64 object payloads and JSON erasure parameters |
-| [0006](docs/adr/0006-concurrency-contract.md) | Concurrency contract: MetadataStore mutex, KEK ring shared_mutex, tolerated per-object races |
-
-Mermaid diagram for runtime wiring and boundaries:
-
+```bash
+curl http://localhost:8080/objects/00000000-0000-0000-0000-000000000001/health
+# {
+#   "object_id": "00000000-0000-0000-0000-000000000001",
+#   "total_shards": 3,
+#   "available_shards": 3,
+#   "required_shards": 2,
+#   "missing_indices": [],
+#   "healthy": true,
+#   "fully_replicated": true
+# }
 ```
-[API Consumer]
-      |
-      v
-[StorageClientServer :8080]
-      |
-      v
-[StorageClient]
-      │
-      ├── ErasureCodec (ISA-L RS)
-      ├── Crypto (AES-256-GCM + ML-KEM-768)
-      ├── ShardTransport
-      │         ├── Node :9001 → StorageNode → LMDB1
-      │         ├── Node :9002 → StorageNode → LMDB2
-      │         └── Node :9003 → StorageNode → LMDB3
-      └── MetadataStore → PostgreSQL
+
+Returns shard availability by probing each storage node. `healthy` indicates whether enough shards exist for reconstruction (`available >= required`). `fully_replicated` indicates all shards are present.
+
+### Repair a degraded object
+
+```bash
+curl -X POST http://localhost:8080/objects/00000000-0000-0000-0000-000000000001/repair
+# {"status":"ok","repaired":true}
 ```
+
+Reconstructs missing shards from surviving ones using erasure coding, re-encrypts them with the original DEK (fresh nonces), and places them on eligible nodes. Uses optimistic version fencing and returns `"repaired": false` if a concurrent mutation occurred during repair.
+
 
 ## VI. Storage Node API
 
@@ -139,14 +171,36 @@ Used internally by the client. Each node exposes:
 | Method | Route | Body | Description |
 |--------|-------|------|-------------|
 | GET | `/health` | - | Health check |
-| PUT | `/shards/:location` | raw bytes | Store a shard |
-| GET | `/shards/:location` | - | Retrieve a shard |
-| DELETE | `/shards/:location` | - | Delete a shard |
+| PUT | `/shards?location=<shard_key>` | raw bytes | Store a shard |
+| GET | `/shards?location=<shard_key>` | - | Retrieve a shard |
+| DELETE | `/shards?location=<shard_key>` | - | Delete a shard |
 
 ## VII. Rough Backlog
 
-* Improve the placement strategy by selecting nodes randomly from those available.
-* Add a repair strategy that operates on a single route.
-* Implement metrics collection and include a few benchmark tests.
+* ~~Improve the placement strategy by selecting nodes from those available.~~ &nbsp;&nbsp; Implemented via dynamic node registry.
+* ~~Add a repair strategy that operates on a single route.~~ &nbsp;&nbsp; Implemented via `/objects/:id/repair`.
+* ~~Implement metrics collection to begin benchmarking.~~ &nbsp;&nbsp; Implemented via `MetricsCollector` + `benchmark` executable.
 * Introduce a chunking strategy to manage data or workload more effectively.
 * Implement a garbage collection strategy to clean up unused resources.
+
+## VIII. Benchmarking
+
+The `benchmark` executable runs PUT/GET/REPAIR operations across parameter combinations and exports timing results to CSV.
+
+```bash
+# Start the integration cluster first
+./scripts/setup-integration.sh
+
+# Run the benchmark
+# Results are written to docs/metrics/benchmark_results.csv by default
+./build/Release/benchmark
+```
+
+Configurable via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BENCHMARK_METADATA_CONN` | localhost test DB | PostgreSQL connection string |
+| `BENCHMARK_CSV_PATH` | `benchmark_results.csv` | Output CSV file path |
+
+CSV columns: `operation`, `k`, `m`, `shard_size`, `object_size`, `failed_nodes`, `total_nodes`, `crypto_ms`, `transport_ms`, `total_ms`, `success`, `storage_overhead`.

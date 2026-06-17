@@ -302,7 +302,7 @@ TEST(ErasureCodecTest, ChecksumDetectsSilentPostDecryptionCorruption) {
     plain_shards[0].bytes[0] ^= 0x01;
 
     // Decode still "succeeds" (RS doesn't detect corruption in data shards
-    // when all data shards are present — fast path)
+    // when all data shards are present - fast path)
     Bytes decoded = decode(plain_shards, spec, original.size());
 
     // The output is silently wrong

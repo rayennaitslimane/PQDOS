@@ -8,6 +8,7 @@
 //    may interleave; last metadata write wins. Orphaned shards are tolerated.
 
 #include "MetadataStore.hpp"
+#include "MetricsCollector.hpp"
 #include "Models.hpp"
 
 #include <botan/pk_keys.h>
@@ -29,6 +30,11 @@ public:
     bool remove(const std::string& object_id);
     std::vector<ObjectMetadata> list();
     void rotate();
+    ObjectHealth health(const std::string& object_id);
+    bool repair(const std::string& object_id);
+
+    MetadataStore& metadata_store() { return metadata_store_; }
+    void set_collector(MetricsCollector* c) { collector_ = c; }
 
     StorageClient(const StorageClient&) = delete;
     StorageClient& operator=(const StorageClient&) = delete;
@@ -42,4 +48,5 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Botan::Private_Key>> kek_ring_;
     std::string active_kek_id_;
     std::string kek_file_path_;
+    MetricsCollector* collector_ = nullptr;
 };
