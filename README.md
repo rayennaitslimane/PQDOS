@@ -204,3 +204,9 @@ Configurable via environment variables:
 | `BENCHMARK_CSV_PATH` | `benchmark_results.csv` | Output CSV file path |
 
 CSV columns: `operation`, `k`, `m`, `shard_size`, `object_size`, `failed_nodes`, `total_nodes`, `crypto_ms`, `transport_ms`, `total_ms`, `success`, `storage_overhead`.
+
+The exported CSV is analyzed in the Jupyter notebooks under [docs/metrics/](docs/metrics/README.md) ([performance](docs/metrics/01_performance.ipynb), [reliability](docs/metrics/02_reliability.ipynb)).
+
+### System evaluation
+
+[SYSTEM-EVALUATION.md](SYSTEM-EVALUATION.md) is the written analysis of those benchmark runs. It walks through where latency actually goes (post-quantum crypto is effectively free; shard transport and an uninstrumented metadata layer dominate), how erasure durability tracks Reed-Solomon theory, the storage-overhead trade-offs, and the highest-leverage fixes — all cross-referenced to the [ADRs](docs/adr/) and the metrics notebooks.

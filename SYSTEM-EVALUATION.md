@@ -1,81 +1,112 @@
 # PQDOS System Evaluation
 
-## I. Introduction
+## How this was measured
 
-This report evaluates the post-quantum distributed object store (PQDOS) using the
-benchmark harness in [cmd/BenchmarkMain.cpp](cmd/BenchmarkMain.cpp), which drives the real
-`StorageClient` API across a sweep of erasure parameters (`k ∈ {2,4,6,8}`, `m ∈ {1,2,3,4}`)
-and object sizes (1 KB-1 MB). Findings are drawn from the performance and reliability
-notebooks ([docs/metrics/01_performance.ipynb](docs/metrics/01_performance.ipynb),
-[docs/metrics/02_reliability.ipynb](docs/metrics/02_reliability.ipynb)) over 1,596 records,
-interpreted against the architecture defined in [docs/adr/](docs/adr/README.md).
+Everything below comes from running the benchmark harness in
+[cmd/BenchmarkMain.cpp](cmd/BenchmarkMain.cpp) against a real cluster. The harness doesn't mock
+anything: it drives the actual `StorageClient` API through a sweep of erasure settings (`k` from
+2 to 8, `m` from 1 to 4) and object sizes from 1 KB to 1 MB, then records timing and outcome for
+every `PUT`, `GET` and `REPAIR`. The two notebooks in
+[docs/metrics/](docs/metrics/README.md) turn those ~1,600 records into the charts and tables this
+report leans on, and the design rationale lives in the [ADRs](docs/adr/README.md). Where I make a
+claim, I've tried to point at the chart or the ADR that backs it.
 
-## II. Executive Summary
+## The short version
 
-The system is functionally correct and its post-quantum security is effectively free: 
+PQDOS does what it set out to do. Objects encrypt, split, store, survive node loss, and come back
+intact, and the post-quantum machinery costs almost nothing to run. The interesting part is where
+the time actually goes, because it isn't where you'd expect.
 
-ML-KEM-768 + AES-256-GCM adds under 1 ms per operation. The dominant cost is the write path (`PUT` ≈ 9.3 ms, 5.7x a `GET`), driven by shard transport. Durability behaves exactly as Reed-Solomon theory predicts-objects recover if and only if failures <= `m`. The two biggest issues are not in the instrumented hot path at all: a large, *unmeasured* metadata layer (PostgreSQL behind a single serialized connection) and operational gaps in key management and shard garbage collection.
+If you only remember three things:
 
-## III. Key Findings
+- **The post-quantum crypto is basically free.** ML-KEM-768 plus AES-256-GCM adds well under a
+  millisecond per operation. Security was never the thing slowing this system down.
+- **Writes are the expensive path, and the network is why.** A `PUT` takes roughly 9 ms, around
+  five to six times a `GET`, and most of that is shard transport over HTTP.
+- **The real bottleneck isn't even on the chart.** A large slice of every operation is spent in
+  the metadata layer, which the current metrics don't time at all. That blind spot, not the
+  cryptography, is what would cap throughput first.
 
-1. **Crypto is negligible; transport dominates.** Mean phase split for `PUT` is 0.75 ms crypto
-   vs 6.0 ms transport; for `GET`, 0.36 ms vs 0.64 ms. The post-quantum KEM is not a
-   performance concern, validating [ADR-0001](docs/adr/0001-quantum-encryption.md).
+## Where the time goes
 
-2. **A hidden metadata tax.** Instrumented phases (crypto + transport) do not sum to the
-   measured total: the gap is ~27% for `PUT`, ~39% for `GET`, and ~65% for `REPAIR`
-   (2.55 ms of 7.24 ms is accounted for; the rest is elsewhere). This unmeasured time is the
-   PostgreSQL path-single `pqxx::connection` serialized by the [ADR-0006](docs/adr/0006-concurrency-contract.md)
-   mutex, plus the N+1 query in `list()` ([ADR-0003](docs/adr/0003-dual-storage.md)). It is
-   the system's real bottleneck and is invisible to the current metrics.
+The phase breakdown in [01_performance.ipynb](docs/metrics/01_performance.ipynb) splits each
+operation into a crypto phase and a transport phase. The crypto phase barely registers — a
+fraction of a millisecond for both reads and writes — while transport dominates the write path.
+That's exactly the outcome [ADR-0001](docs/adr/0001-quantum-encryption.md) was hoping for: a
+per-object DEK wrapped by an ML-KEM-768 KEK is cheap enough that you never have to think about it
+again.
 
-3. **Durability tracks parity exactly.** Overall `REPAIR` success is 0.73, but this average is
-   misleading: `m=4` configs recover 100% of the time, while `m=1` configs collapse to
-   0.33-0.50 once the failure sweep drops more than one shard. Recovery is governed solely by
-   `survivors ≥ k`, confirming the MDS property of the ISA-L codec ([ADR-0002](docs/adr/0002-erasure-codec.md)).
+The catch is that the two timed phases don't add up to the measured total. There's a consistent
+gap — modest on `PUT`, larger on `GET`, and largest of all on `REPAIR`, where it accounts for the
+majority of the operation. That missing time is the PostgreSQL metadata path, and it's missing for
+a structural reason: [ADR-0006](docs/adr/0006-concurrency-contract.md) funnels every metadata call
+through a single connection behind one mutex, and [ADR-0003](docs/adr/0003-dual-storage.md)
+documents an N+1 query in `list()` that fires one extra round-trip per object. None of this is
+instrumented, so it's invisible in the charts even though it's some of the most expensive work the
+system does. The single biggest improvement available here is simply *measuring* it.
 
-4. **Small objects pay a fixed-overhead penalty.** Measured storage overhead converges on the
-   theoretical `(k+m)/k` rate for large objects, but a 1 KB object at `2+1` costs 3.2x (vs a
-   1.5x asymptote) due to per-shard nonce + GCM tag + msgpack framing. Overhead is amortized by
-   larger objects and higher `k` (e.g. `8+2` = 1.32x vs `2+2` = 2.03x for equal durability).
+## Durability behaves exactly like the theory says
 
-5. **Repair is the most expensive and most variable operation** (σ = 4.14 ms). Beyond
-   reconstruction, every repair health-probes all registered nodes over fresh HTTP clients
-   ([ADR-0004](docs/adr/0004-shard-transport.md)), inflating its uninstrumented portion.
+This is the part that's genuinely satisfying. The reliability notebook
+([02_reliability.ipynb](docs/metrics/02_reliability.ipynb)) shows recovery tracking
+Reed-Solomon's guarantee with no surprises: an object comes back if, and only if, at least `k`
+shards survive. Configurations with generous parity (`m=4`) recover every time; configurations
+with `m=1` fall off a cliff the moment more than one shard goes missing.
 
-## IV. Recommendations
+The headline "overall repair success" number is therefore a little misleading on its own — it's an
+average across both robust and fragile configurations, and that average hides the fact that the
+outcome is completely deterministic once you know how many shards were lost. The ISA-L codec
+chosen in [ADR-0002](docs/adr/0002-erasure-codec.md) is doing precisely what it promised. The
+practical lesson is about parameter choice, not codec behaviour: `m=1` is a trap under correlated
+or multi-node failure.
 
-1. **Instrument and parallelize the metadata layer.** Add a `metadata_ms` phase timer to make
-   the hidden tax visible, then break the single-connection serialization with a small
-   connection pool and replace the `list()` N+1 with a single JOIN. This targets the largest
-   real cost, especially for `REPAIR` and `GET`.
+## Small objects pay a tax
 
-2. **Trim the write hot path.** Eliminate the unnecessary defensive copy in `encode()`
-   (ADR-0002 documents this as removable) to save one object-sized allocation per `PUT`, and
-   extend thread-local HTTP client reuse to `init()`/health probes (ADR-0004) so `REPAIR` stops
-   reconstructing clients on every call.
+Storage overhead converges nicely on the theoretical `(k+m)/k` rate for large objects, but small
+ones are punished. A 1 KB object at `2+1` ends up costing a little over three times its size
+against an asymptote closer to 1.5x, because each shard carries fixed framing — a nonce, a GCM
+tag, and msgpack envelope — that's negligible for a megabyte and ruinous for a kilobyte. Higher
+`k` amortizes this well: at equivalent durability, an `8+2` profile is far leaner than `2+2`. The
+takeaway is that PQDOS rewards batching small objects and choosing wider stripes.
 
-3. **Choose erasure defaults deliberately.** Avoid `m=1` in production-durability falls off a
-   cliff under correlated, multi-node failure. Prefer a higher-`k` profile such as `4+2` or
-   `6+3`, which balances the ~1.3-1.5x overhead against tolerating 2-3 simultaneous losses.
+## Repair is the wild card
 
-4. **Fix the benchmark's failure model and add a GC sweep.** In
-   [cmd/BenchmarkMain.cpp](cmd/BenchmarkMain.cpp) the clamp `std::min(requested_failures, m)`
-   is commented out, so the harness can drop more shards than parity allows. Keep it unclamped
-   *intentionally* and sweep `failed_nodes` from `0…m+1` to chart the durability cliff
-   explicitly. Separately, implement the orphaned-shard garbage collector that ADR-0003/0006
-   note is missing-races and failed repairs leak inert shards indefinitely.
+Repair is both the slowest operation and by far the most variable. Reconstruction itself is cheap;
+what inflates it is everything around it. Before writing replacements, `repair()` health-probes
+every registered node, and per [ADR-0004](docs/adr/0004-shard-transport.md) those probes still
+spin up fresh HTTP clients rather than reusing the thread-local ones the hot path already caches.
+Combined with the uninstrumented metadata work, that makes repair latency swing widely from run to
+run. It's the operation most likely to surprise you in production and the one most worth
+tightening.
 
-5. **Harden key management before non-POC use.** The default keystore lives in world-accessible
-   `/tmp` and is a single point of failure, and `rotate()` never re-wraps existing objects
-   (ADR-0001). Add a background re-wrap sweep, a keystore backup, and a non-`/tmp` default.
-   Because crypto is not a performance bottleneck, these carry negligible runtime cost.
+## What I'd fix first
 
-## V. Conclusion
+Roughly in priority order:
 
-PQDOS delivers post-quantum confidentiality and theory-perfect erasure durability at near-zero
-cryptographic cost-a strong foundation. Its performance ceiling, however, is set by an
-uninstrumented metadata layer and a transport-heavy write path, not by the security primitives.
-Making the metadata cost visible, relieving the single-connection bottleneck, choosing parity
-to match the real failure model, and closing the key-management and orphan-GC gaps would move
-this system from a correct proof-of-concept toward a production-credible system.
+1. **Make the metadata cost visible, then relieve it.** Add a `metadata_ms` timer so the hidden
+   tax stops being a guess, then break the single-connection serialization with a small pool and
+   replace the `list()` N+1 with one JOIN. This is the highest-leverage change in the whole system.
+2. **Trim the write path.** Drop the unnecessary defensive copy in `encode()` that ADR-0002 flags
+   as removable, and extend the thread-local HTTP client reuse to `init()` and the health probes
+   so repair stops rebuilding clients on every call.
+3. **Pick erasure defaults on purpose.** Avoid `m=1` in anything that matters. A `4+2` or `6+3`
+   profile buys tolerance for two or three simultaneous losses at a sane overhead.
+4. **Fix the failure model and add garbage collection.** The benchmark currently leaves the
+   `std::min(requested_failures, m)` clamp commented out in
+   [cmd/BenchmarkMain.cpp](cmd/BenchmarkMain.cpp); sweeping `failed_nodes` from 0 to `m+1` would
+   chart the durability cliff explicitly. Separately, the orphaned-shard collector that ADR-0003
+   and ADR-0006 both note as missing needs to exist — races and failed repairs leak inert shards
+   today.
+5. **Harden key management before this is more than a POC.** The default keystore sits in
+   world-accessible `/tmp` and is a single point of failure, and `rotate()` never re-wraps
+   existing objects (ADR-0001). Since crypto isn't a performance concern, a re-wrap sweep, a
+   keystore backup, and a non-`/tmp` default all come essentially for free.
+
+## Closing thought
+
+PQDOS already delivers the hard parts: post-quantum confidentiality at rest and erasure durability
+that matches the math, both at negligible cryptographic cost. Its ceiling is set by an unmeasured
+metadata layer and a transport-heavy write path — engineering problems, not cryptographic ones.
+Instrument the metadata, relieve the single connection, choose parity to match the real failure
+model, and close the key-management and orphan-GC gaps, and this moves from a correct
+proof-of-concept toward something you could actually run.
