@@ -30,14 +30,14 @@ If you only remember three things:
 ## Where the time goes
 
 The phase breakdown in [01_performance.ipynb](docs/metrics/01_performance.ipynb) splits each
-operation into a crypto phase and a transport phase. The crypto phase barely registers — a
-fraction of a millisecond for both reads and writes — while transport dominates the write path.
+operation into a crypto phase and a transport phase. The crypto phase barely registers, a
+fraction of a millisecond for both reads and writes, while transport dominates the write path.
 That's exactly the outcome [ADR-0001](docs/adr/0001-quantum-encryption.md) was hoping for: a
 per-object DEK wrapped by an ML-KEM-768 KEK is cheap enough that you never have to think about it
 again.
 
 The catch is that the two timed phases don't add up to the measured total. There's a consistent
-gap — modest on `PUT`, larger on `GET`, and largest of all on `REPAIR`, where it accounts for the
+gap, modest on `PUT`, larger on `GET`, and largest of all on `REPAIR`, where it accounts for the
 majority of the operation. That missing time is the PostgreSQL metadata path, and it's missing for
 a structural reason: [ADR-0006](docs/adr/0006-concurrency-contract.md) funnels every metadata call
 through a single connection behind one mutex, and [ADR-0003](docs/adr/0003-dual-storage.md)
@@ -53,7 +53,7 @@ Reed-Solomon's guarantee with no surprises: an object comes back if, and only if
 shards survive. Configurations with generous parity (`m=4`) recover every time; configurations
 with `m=1` fall off a cliff the moment more than one shard goes missing.
 
-The headline "overall repair success" number is therefore a little misleading on its own — it's an
+The headline "overall repair success" number is therefore a little misleading on its own, it's an
 average across both robust and fragile configurations, and that average hides the fact that the
 outcome is completely deterministic once you know how many shards were lost. The ISA-L codec
 chosen in [ADR-0002](docs/adr/0002-erasure-codec.md) is doing precisely what it promised. The
@@ -64,8 +64,8 @@ or multi-node failure.
 
 Storage overhead converges nicely on the theoretical `(k+m)/k` rate for large objects, but small
 ones are punished. A 1 KB object at `2+1` ends up costing a little over three times its size
-against an asymptote closer to 1.5x, because each shard carries fixed framing — a nonce, a GCM
-tag, and msgpack envelope — that's negligible for a megabyte and ruinous for a kilobyte. Higher
+against an asymptote closer to 1.5x, because each shard carries fixed framing, a nonce, a GCM
+tag, and msgpack envelope, that's negligible for a megabyte and ruinous for a kilobyte. Higher
 `k` amortizes this well: at equivalent durability, an `8+2` profile is far leaner than `2+2`. The
 takeaway is that PQDOS rewards batching small objects and choosing wider stripes.
 
@@ -95,7 +95,7 @@ Roughly in priority order:
    `std::min(requested_failures, m)` clamp commented out in
    [cmd/BenchmarkMain.cpp](cmd/BenchmarkMain.cpp); sweeping `failed_nodes` from 0 to `m+1` would
    chart the durability cliff explicitly. Separately, the orphaned-shard collector that ADR-0003
-   and ADR-0006 both note as missing needs to exist — races and failed repairs leak inert shards
+   and ADR-0006 both note as missing needs to exist, races and failed repairs leak inert shards
    today.
 5. **Harden key management before this is more than a POC.** The default keystore sits in
    world-accessible `/tmp` and is a single point of failure, and `rotate()` never re-wraps
@@ -106,7 +106,7 @@ Roughly in priority order:
 
 PQDOS already delivers the hard parts: post-quantum confidentiality at rest and erasure durability
 that matches the math, both at negligible cryptographic cost. Its ceiling is set by an unmeasured
-metadata layer and a transport-heavy write path — engineering problems, not cryptographic ones.
+metadata layer and a transport-heavy write path, engineering problems, not cryptographic ones.
 Instrument the metadata, relieve the single connection, choose parity to match the real failure
 model, and close the key-management and orphan-GC gaps, and this moves from a correct
 proof-of-concept toward something you could actually run.

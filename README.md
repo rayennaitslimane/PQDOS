@@ -209,4 +209,4 @@ The exported CSV is analyzed in the Jupyter notebooks under [docs/metrics/](docs
 
 ### System evaluation
 
-[SYSTEM-EVALUATION.md](SYSTEM-EVALUATION.md) is the written analysis of those benchmark runs. It walks through where latency actually goes (post-quantum crypto is effectively free; shard transport and an uninstrumented metadata layer dominate), how erasure durability tracks Reed-Solomon theory, the storage-overhead trade-offs, and the highest-leverage fixes — all cross-referenced to the [ADRs](docs/adr/) and the metrics notebooks.
+[SYSTEM-EVALUATION.md](SYSTEM-EVALUATION.md) is the written analysis of those benchmark runs. It walks through where latency actually goes (post-quantum crypto is effectively free; shard transport and an uninstrumented metadata layer dominate), how erasure durability tracks Reed-Solomon theory, the storage-overhead trade-offs, and the highest-leverage fixes, all cross-referenced to the [ADRs](docs/adr/) and the metrics notebooks.
