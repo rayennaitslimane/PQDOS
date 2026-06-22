@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -251,6 +252,7 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
     // Metrics: phase timers
     double crypto_ms = 0.0;
     double transport_ms = 0.0;
+    double metadata_ms = 0.0;
     auto put_start = std::chrono::steady_clock::now();
 
     // 3) Generate plain shards from bytes
@@ -321,7 +323,10 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
     metadata.encrypted_dek = wrapped_dek;
     metadata.kek_id = active_kek_id_;
 
-    metadata_store_.put(metadata);
+    {
+        ScopedTimer metadata_timer(&metadata_ms);
+        metadata_store_.put(metadata);
+    }
 
     // Record metrics
     if (collector_) {
@@ -342,6 +347,7 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
         rec.params.total_nodes = static_cast<uint32_t>(eligible_nodes.size());
         rec.timing.crypto_ms = crypto_ms;
         rec.timing.transport_ms = transport_ms;
+        rec.timing.metadata_ms = metadata_ms;
         rec.timing.total_ms = total_ms;
         rec.success = true;
         rec.storage_overhead = static_cast<double>(total_stored) / static_cast<double>(bytes.size());
@@ -357,10 +363,15 @@ Bytes StorageClient::get(const std::string& object_id) {
     // Metrics: phase timers
     double crypto_ms = 0.0;
     double transport_ms = 0.0;
+    double metadata_ms = 0.0;
     auto get_start = std::chrono::steady_clock::now();
 
     // 1) Load metadata
-    const auto metadata_opt = metadata_store_.get(object_id);
+    std::optional<ObjectMetadata> metadata_opt;
+    {
+        ScopedTimer metadata_timer(&metadata_ms);
+        metadata_opt = metadata_store_.get(object_id);
+    }
     if (!metadata_opt.has_value()) {
         throw std::runtime_error("StorageClient::get: object not found: " + object_id);
     }
@@ -431,6 +442,7 @@ Bytes StorageClient::get(const std::string& object_id) {
         rec.params.total_nodes = static_cast<uint32_t>(metadata.shard_locations.size());
         rec.timing.crypto_ms = crypto_ms;
         rec.timing.transport_ms = transport_ms;
+        rec.timing.metadata_ms = metadata_ms;
         rec.timing.total_ms = total_ms;
         rec.success = true;
         collector_->record(std::move(rec));
@@ -540,10 +552,16 @@ bool StorageClient::repair(const std::string& object_id) {
     double crypto_ms = 0.0;
     double transport_fetch_ms = 0.0;
     double transport_apply_ms = 0.0;
+    double metadata_get_ms = 0.0;
+    double metadata_put_ms = 0.0;
     auto repair_start = std::chrono::steady_clock::now();
 
     // 1) Load metadata and record version
-    const auto metadata_opt = metadata_store_.get(object_id);
+    std::optional<ObjectMetadata> metadata_opt;
+    {
+        ScopedTimer metadata_timer(&metadata_get_ms);
+        metadata_opt = metadata_store_.get(object_id);
+    }
     if (!metadata_opt.has_value()) {
         throw std::runtime_error("StorageClient::repair: object not found: " + object_id);
     }
@@ -575,6 +593,7 @@ bool StorageClient::repair(const std::string& object_id) {
         rec.params.total_nodes = static_cast<uint32_t>(metadata.shard_locations.size());
         rec.timing.crypto_ms = crypto_ms;
         rec.timing.transport_ms = transport_fetch_ms + transport_apply_ms;
+        rec.timing.metadata_ms = metadata_get_ms + metadata_put_ms;
         rec.timing.total_ms = total_ms;
         rec.success = success;
         collector_->record(std::move(rec));
@@ -792,7 +811,12 @@ bool StorageClient::repair(const std::string& object_id) {
         ObjectMetadata updated_metadata = metadata;
         updated_metadata.shard_locations = updated_shard_locations;
 
-        if (!metadata_store_.conditional_put(updated_metadata, expected_version)) {
+        bool committed = false;
+        {
+            ScopedTimer metadata_timer(&metadata_put_ms);
+            committed = metadata_store_.conditional_put(updated_metadata, expected_version);
+        }
+        if (!committed) {
             return false; // version changed - concurrent mutation
         }
 

@@ -1,7 +1,8 @@
 #pragma once
 
 // Concurrency contract:
-// 1. MetadataStore access is serialized (per-instance mutex on pqxx::connection).
+// 1. MetadataStore access uses a bounded pqxx::connection pool; each connection
+//    is checked out to one thread at a time, so operations run concurrently.
 // 2. KEK ring reads (put/get) are shared-locked; writes (rotate) are exclusive-locked.
 // 3. StorageNode requires no application-level locking (LMDB handles it).
 // 4. Per-object ordering is NOT guaranteed. Concurrent mutations on the same object

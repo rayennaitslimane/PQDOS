@@ -20,7 +20,11 @@ Key requirements:
 
 `StorageClient` gains a `MetricsCollector* collector_ = nullptr` member with a `set_collector()` setter. When null (default), no metrics are recorded - existing tests and production paths are unaffected.
 
-Inline `ScopedTimer` RAII objects are placed around the real crypto and transport boundaries inside `put()`, `get()`, and `repair()`. At method end, an `if (collector_)` guard builds and records an `OperationRecord`.
+Inline `ScopedTimer` RAII objects are placed around the real crypto, transport,
+and metadata-store boundaries inside `put()`, `get()`, and `repair()`. At method
+end, an `if (collector_)` guard builds and records an `OperationRecord`. The
+`metadata_ms` phase isolates time spent in `MetadataStore` (the persistence
+round-trips on the critical path) so it is measured rather than guessed.
 
 ```cpp
 struct ScopedTimer {
@@ -41,7 +45,7 @@ Computed inside `put()` as `sum(serialized_shards[i].size()) / bytes.size()`, ca
 
 ### CSV output only
 
-Results are persisted as CSV with columns: `operation`, `k`, `m`, `shard_size`, `object_size`, `failed_nodes`, `total_nodes`, `crypto_ms`, `transport_ms`, `total_ms`, `success`, `storage_overhead`. CSV is sufficient for spreadsheet and scripting analysis; no JSON export is provided.
+Results are persisted as CSV with columns: `operation`, `k`, `m`, `shard_size`, `object_size`, `failed_nodes`, `total_nodes`, `crypto_ms`, `transport_ms`, `metadata_ms`, `total_ms`, `success`, `storage_overhead`. CSV is sufficient for spreadsheet and scripting analysis; no JSON export is provided.
 
 ### Benchmark harness as a separate executable
 

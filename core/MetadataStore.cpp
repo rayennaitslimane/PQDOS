@@ -1,21 +1,53 @@
 #include "Models.hpp"
 #include "MetadataStore.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
-MetadataStore::MetadataStore(const std::string& conn_str)
-    : conn_(conn_str)
-{
-    init_schema();
-    prepare_statements();
+MetadataStore::MetadataStore(const std::string& conn_str, std::size_t pool_size) {
+    pool_size = std::max<std::size_t>(1, pool_size);
+    connections_.reserve(pool_size);
+
+    for (std::size_t i = 0; i < pool_size; ++i) {
+        auto conn = std::make_unique<pqxx::connection>(conn_str);
+
+        // The schema is idempotent (CREATE IF NOT EXISTS); applying it once is
+        // sufficient. Prepared statements are per-connection, so every pooled
+        // connection must prepare its own.
+        if (i == 0) {
+            init_schema(*conn);
+        }
+        prepare_statements(*conn);
+
+        available_.push(conn.get());
+        connections_.push_back(std::move(conn));
+    }
 }
 
-void MetadataStore::init_schema() {
-    pqxx::work tx{conn_};
+MetadataStore::PooledConnection MetadataStore::acquire() {
+    std::unique_lock<std::mutex> lock(pool_mu_);
+    pool_cv_.wait(lock, [this] { return !available_.empty(); });
+
+    pqxx::connection* conn = available_.front();
+    available_.pop();
+
+    return PooledConnection(*this, conn);
+}
+
+void MetadataStore::release(pqxx::connection* conn) {
+    {
+        std::lock_guard<std::mutex> lock(pool_mu_);
+        available_.push(conn);
+    }
+    pool_cv_.notify_one();
+}
+
+void MetadataStore::init_schema(pqxx::connection& conn) {
+    pqxx::work tx{conn};
 
     tx.exec(R"SQL(
         CREATE TABLE IF NOT EXISTS object_metadata (
@@ -55,10 +87,10 @@ void MetadataStore::init_schema() {
 }
 
 void MetadataStore::put(const ObjectMetadata& metadata) {
-    std::lock_guard<std::mutex> lock(mu_);
+    auto conn = acquire();
     validate_metadata(metadata);
 
-    pqxx::work tx{conn_};
+    pqxx::work tx{*conn};
 
     const std::int64_t object_size = checked_size_to_i64(metadata.size);
     const Bytes erasure_bytes = metadata.erasure.serialize();
@@ -120,8 +152,8 @@ void MetadataStore::put(const ObjectMetadata& metadata) {
 }
 
 std::optional<ObjectMetadata> MetadataStore::get(const std::string& id) {
-    std::lock_guard<std::mutex> lock(mu_);
-    pqxx::read_transaction tx{conn_};
+    auto conn = acquire();
+    pqxx::read_transaction tx{*conn};
 
     pqxx::result metadata_rows = tx.exec(
         pqxx::prepped{"get_object_metadata"},
@@ -141,8 +173,8 @@ std::optional<ObjectMetadata> MetadataStore::get(const std::string& id) {
 }
 
 bool MetadataStore::remove(const std::string& id) {
-    std::lock_guard<std::mutex> lock(mu_);
-    pqxx::work tx{conn_};
+    auto conn = acquire();
+    pqxx::work tx{*conn};
 
     pqxx::result result = tx.exec(
         pqxx::prepped{"remove_object_metadata"},
@@ -159,31 +191,40 @@ bool MetadataStore::remove(const std::string& id) {
 }
 
 std::vector<ObjectMetadata> MetadataStore::list() {
-    std::lock_guard<std::mutex> lock(mu_);
-    pqxx::read_transaction tx{conn_};
+    auto conn = acquire();
+    pqxx::read_transaction tx{*conn};
 
     pqxx::result rows = tx.exec(
         pqxx::prepped{"list_object_metadata"},
         pqxx::params{}
     );
 
+    // The query LEFT JOINs object_shard_locations and is ordered by
+    // (id, shard_index), so each object's rows are contiguous and its shard
+    // locations arrive in index order. A new ObjectMetadata is started whenever
+    // the id changes; the location column is NULL for objects with no shards.
     std::vector<ObjectMetadata> objects;
-    objects.reserve(rows.size());
 
     for (const auto& row : rows) {
-        ObjectMetadata metadata = row_to_object_metadata(row);
-        metadata.shard_locations = get_shard_locations(tx, metadata.id);
-        objects.push_back(std::move(metadata));
+        const std::string id = row["id"].c_str();
+
+        if (objects.empty() || objects.back().id != id) {
+            objects.push_back(row_to_object_metadata(row));
+        }
+
+        if (!row["location"].is_null()) {
+            objects.back().shard_locations.push_back(row["location"].c_str());
+        }
     }
 
     return objects;
 }
 
 bool MetadataStore::conditional_put(const ObjectMetadata& metadata, int expected_version) {
-    std::lock_guard<std::mutex> lock(mu_);
+    auto conn = acquire();
     validate_metadata(metadata);
 
-    pqxx::work tx{conn_};
+    pqxx::work tx{*conn};
 
     const std::int64_t object_size = checked_size_to_i64(metadata.size);
     const Bytes erasure_bytes = metadata.erasure.serialize();
@@ -240,8 +281,8 @@ bool MetadataStore::conditional_put(const ObjectMetadata& metadata, int expected
 }
 
 void MetadataStore::register_node(const std::string& address) {
-    std::lock_guard<std::mutex> lock(mu_);
-    pqxx::work tx{conn_};
+    auto conn = acquire();
+    pqxx::work tx{*conn};
 
     tx.exec(
         pqxx::prepped{"register_node"},
@@ -252,8 +293,8 @@ void MetadataStore::register_node(const std::string& address) {
 }
 
 bool MetadataStore::unregister_node(const std::string& address) {
-    std::lock_guard<std::mutex> lock(mu_);
-    pqxx::work tx{conn_};
+    auto conn = acquire();
+    pqxx::work tx{*conn};
 
     pqxx::result result = tx.exec(
         pqxx::prepped{"unregister_node"},
@@ -265,8 +306,8 @@ bool MetadataStore::unregister_node(const std::string& address) {
 }
 
 std::vector<std::string> MetadataStore::list_nodes() {
-    std::lock_guard<std::mutex> lock(mu_);
-    pqxx::read_transaction tx{conn_};
+    auto conn = acquire();
+    pqxx::read_transaction tx{*conn};
 
     pqxx::result rows = tx.exec(
         pqxx::prepped{"list_nodes"},
@@ -283,8 +324,8 @@ std::vector<std::string> MetadataStore::list_nodes() {
     return addresses;
 }
 
-void MetadataStore::prepare_statements() {
-    conn_.prepare(
+void MetadataStore::prepare_statements(pqxx::connection& conn) {
+    conn.prepare(
         "put_object_metadata",
         R"SQL(
             INSERT INTO object_metadata (
@@ -317,7 +358,7 @@ void MetadataStore::prepare_statements() {
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "conditional_put_object_metadata",
         R"SQL(
             UPDATE object_metadata
@@ -332,7 +373,7 @@ void MetadataStore::prepare_statements() {
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "delete_object_shard_locations",
         R"SQL(
             DELETE FROM object_shard_locations
@@ -340,7 +381,7 @@ void MetadataStore::prepare_statements() {
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "insert_object_shard_location",
         R"SQL(
             INSERT INTO object_shard_locations (
@@ -356,7 +397,7 @@ void MetadataStore::prepare_statements() {
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "get_object_metadata",
         R"SQL(
             SELECT
@@ -372,7 +413,7 @@ void MetadataStore::prepare_statements() {
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "get_object_shard_locations",
         R"SQL(
             SELECT location
@@ -382,7 +423,7 @@ void MetadataStore::prepare_statements() {
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "remove_object_metadata",
         R"SQL(
             DELETE FROM object_metadata
@@ -390,23 +431,26 @@ void MetadataStore::prepare_statements() {
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "list_object_metadata",
         R"SQL(
             SELECT
-                id::text,
-                size,
-                checksum,
-                erasure_spec,
-                encrypted_dek,
-                kek_id,
-                version
-            FROM object_metadata
-            ORDER BY id ASC
+                m.id::text AS id,
+                m.size,
+                m.checksum,
+                m.erasure_spec,
+                m.encrypted_dek,
+                m.kek_id,
+                m.version,
+                l.location AS location
+            FROM object_metadata m
+            LEFT JOIN object_shard_locations l
+                ON l.object_id = m.id
+            ORDER BY m.id ASC, l.shard_index ASC
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "register_node",
         R"SQL(
             INSERT INTO nodes (address)
@@ -415,7 +459,7 @@ void MetadataStore::prepare_statements() {
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "unregister_node",
         R"SQL(
             DELETE FROM nodes
@@ -423,7 +467,7 @@ void MetadataStore::prepare_statements() {
         )SQL"
     );
 
-    conn_.prepare(
+    conn.prepare(
         "list_nodes",
         R"SQL(
             SELECT address

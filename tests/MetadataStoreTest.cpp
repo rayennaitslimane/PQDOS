@@ -340,8 +340,8 @@ TEST_F(MetadataStoreTest, PutRejectsInvalidUuidFromDatabaseCast) {
 // ===========================================================================
 
 // Verifies that concurrent put/get/remove/list on a single MetadataStore
-// instance (single pqxx::connection) does not crash, deadlock, or produce
-// data races. Validates contract point 1: MetadataStore serialization.
+// instance (bounded pqxx::connection pool) does not crash, deadlock, or produce
+// data races. Validates contract point 1: MetadataStore connection isolation.
 TEST_F(MetadataStoreTest, ConcurrentMetadataStoreAccessOnSingleClient) {
     constexpr int kNumThreads = 8;
     constexpr int kOpsPerThread = 10;

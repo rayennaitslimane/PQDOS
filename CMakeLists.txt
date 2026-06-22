@@ -88,6 +88,9 @@ target_link_libraries(storage_client PRIVATE pqdos)
 add_executable(benchmark cmd/BenchmarkMain.cpp)
 target_link_libraries(benchmark PRIVATE pqdos)
 
+add_executable(metadata_benchmark cmd/MetadataBenchmarkMain.cpp)
+target_link_libraries(metadata_benchmark PRIVATE pqdos)
+
 install(TARGETS pqdos storage_node storage_client
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib

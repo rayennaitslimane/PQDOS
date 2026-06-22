@@ -23,7 +23,7 @@ void MetricsCollector::export_csv(const std::string& path, bool append) const {
 
     if (write_header) {
         file << "operation,k,m,shard_size,object_size,failed_nodes,total_nodes,"
-                "crypto_ms,transport_ms,total_ms,success,storage_overhead\n";
+                "crypto_ms,transport_ms,metadata_ms,total_ms,success,storage_overhead\n";
     }
 
     for (const auto& r : records_) {
@@ -36,6 +36,7 @@ void MetricsCollector::export_csv(const std::string& path, bool append) const {
              << r.params.total_nodes << ","
              << r.timing.crypto_ms << ","
              << r.timing.transport_ms << ","
+             << r.timing.metadata_ms << ","
              << r.timing.total_ms << ","
              << (r.success ? 1 : 0) << ","
              << r.storage_overhead << "\n";

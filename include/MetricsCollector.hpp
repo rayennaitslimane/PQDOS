@@ -17,6 +17,7 @@ struct BenchmarkParams {
 struct PhaseTiming {
     double crypto_ms = 0.0;
     double transport_ms = 0.0;
+    double metadata_ms = 0.0;
     double total_ms = 0.0;
 };
 

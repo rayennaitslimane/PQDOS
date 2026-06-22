@@ -4,7 +4,7 @@ The benchmark harness (``cmd/BenchmarkMain.cpp``) writes a CSV described by
 ADR-0007 with the columns:
 
     operation, k, m, shard_size, object_size, failed_nodes, total_nodes,
-    crypto_ms, transport_ms, total_ms, success, storage_overhead
+    crypto_ms, transport_ms, metadata_ms, total_ms, success, storage_overhead
 
 This module centralises loading, validation and a few small plotting helpers so
 the notebooks stay focused on analysis rather than boilerplate.
@@ -35,6 +35,7 @@ EXPECTED_COLUMNS = [
     "total_nodes",
     "crypto_ms",
     "transport_ms",
+    "metadata_ms",
     "total_ms",
     "success",
     "storage_overhead",
@@ -51,7 +52,7 @@ _INT_COLUMNS = [
     "total_nodes",
     "success",
 ]
-_FLOAT_COLUMNS = ["crypto_ms", "transport_ms", "total_ms", "storage_overhead"]
+_FLOAT_COLUMNS = ["crypto_ms", "transport_ms", "metadata_ms", "total_ms", "storage_overhead"]
 
 
 def load_metrics(path: str | Path | None = None) -> pd.DataFrame:

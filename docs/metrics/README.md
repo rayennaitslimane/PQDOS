@@ -12,6 +12,7 @@ and exports per-operation metrics as CSV (see
 | `metrics_utils.py` | Shared CSV loading, validation and plotting helpers. |
 | `01_performance.ipynb` | Latency (phase breakdown) and storage-overhead analysis. |
 | `02_reliability.ipynb` | Recovery success rate and repair behaviour. |
+| `03_metadata_scaling.ipynb` | `list()` JOIN scaling and connection-pool throughput. |
 | `requirements.txt` | Python dependencies for the notebooks. |
 | `sample_results.csv` | Synthetic fallback so notebooks run without a cluster. |
 
@@ -21,11 +22,12 @@ Produced by `MetricsCollector::export_csv`:
 
 ```
 operation, k, m, shard_size, object_size, failed_nodes, total_nodes,
-crypto_ms, transport_ms, total_ms, success, storage_overhead
+crypto_ms, transport_ms, metadata_ms, total_ms, success, storage_overhead
 ```
 
 `operation` is one of `PUT`, `GET`, `REPAIR`. `storage_overhead` is populated on
-`PUT`; `failed_nodes` is populated on `REPAIR`.
+`PUT`; `failed_nodes` is populated on `REPAIR`. `metadata_ms` is the time spent
+in `MetadataStore` for the operation.
 
 ## Generating the data
 
@@ -44,6 +46,30 @@ Override the output path or DB connection via `BENCHMARK_CSV_PATH` and
 
 If `benchmark_results.csv` is absent, the notebooks fall back to
 `sample_results.csv` so they can still be executed.
+
+### Metadata scaling benchmarks
+
+The pool and `list()` JOIN are throughput/scaling changes that the latency sweep
+above cannot capture (it is single-threaded and never calls `list()`). The
+`metadata_benchmark` executable measures them directly against `MetadataStore`
+and needs only PostgreSQL:
+
+```bash
+cd pqdos-dev
+./scripts/run-metadata-benchmarks.sh   # writes metadata_list_sweep.csv + metadata_throughput.csv
+```
+
+It produces two CSVs consumed by `03_metadata_scaling.ipynb`:
+
+- `metadata_list_sweep.csv` — `num_objects, shards_per_object, list_ms, per_object_ms`
+  (one JOIN vs the N+1 per-object access pattern).
+- `metadata_throughput.csv` — `pool_size, threads, total_ops, duration_ms,
+  throughput_ops_per_sec, mean_latency_ms` (`pool_size=1` reproduces the old
+  single-connection serialization).
+
+Mode and ranges are configurable via `META_BENCH_MODE` (`list`, `throughput`,
+`all`), `META_LIST_SIZES`, `META_POOL_SIZES`, `META_THREADS`,
+`META_OPS_PER_THREAD` and `META_DATASET`.
 
 ## Running the notebooks
 

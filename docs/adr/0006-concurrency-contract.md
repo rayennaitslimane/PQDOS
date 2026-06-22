@@ -1,7 +1,15 @@
 # ADR-0006: Concurrency Contract
 
-**Status:** Accepted  
+**Status:** Accepted (amended)  
 **Date:** 2026-06-12
+
+> **Amendment (2026-06-22):** The single-connection + global-mutex model for
+> `MetadataStore` described below has been replaced by a bounded connection
+> pool, and `list()` no longer issues per-row shard-location queries. See the
+> [Amendment](#amendment-2026-06-22-metadatastore-connection-pool) section at
+> the end of this document. The safety reasoning (libpqxx connections are not
+> thread-safe even for reads) is unchanged; only the mechanism that enforces it
+> changed.
 
 ## Context
 
@@ -122,3 +130,66 @@ This ensures that repair never silently overwrites a concurrent mutation's metad
 - Multi-process deployments (e.g., multiple replicas sharing one PostgreSQL instance) are not safe under this contract. They would require distributed locking (e.g., Postgres advisory locks) or a leader-election mechanism.
 - `rotate()` holds an exclusive lock for its full body including the `save_kek_file` disk write. Under normal conditions this is fast, but on a slow filesystem it temporarily blocks all `put()` and `get()` operations.
 - A failed `repair()` leaves orphaned repaired shards on nodes. These are inert encrypted data and will be reclaimed by a future GC sweep.
+
+## Amendment (2026-06-22): MetadataStore connection pool
+
+The original decision preserved a single `pqxx::connection` guarded by a global
+`std::mutex`, and explicitly flagged the resulting serialization as the system's
+metadata bottleneck ("A connection pool with one connection per thread is the
+natural next step if throughput becomes a constraint"). That step is now taken.
+
+### What changed
+
+1. **Bounded connection pool.** `MetadataStore` now owns a small, fixed pool of
+   `pqxx::connection` objects (default 4, set via an optional constructor
+   argument). A connection is checked out from a free list for the duration of a
+   single operation and returned on completion. Checkout/return is the only thing
+   the mutex (now a `std::mutex` + `std::condition_variable` guarding the free
+   list) protects — it is **not** held for the duration of the transaction.
+   Different operations therefore run on different connections concurrently.
+
+2. **`list()` JOIN.** The previous `list()` issued one query for all metadata
+   rows and then one `get_object_shard_locations` query per row (an N+1). It now
+   issues a single `LEFT JOIN` of `object_metadata` and `object_shard_locations`
+   ordered by `(id, shard_index)`, assembled into objects in one pass.
+
+### Why it remains safe
+
+- **libpqxx thread-safety is respected.** The original hazard was sharing one
+  non-thread-safe `pqxx::connection` across handler threads. The pool removes
+  sharing: each connection is owned by exactly one thread at a time via the
+  checkout, so no connection ever has two concurrent transactions. Invariant #1
+  is restated below in pooled terms.
+- **Per-connection prepared statements.** Prepared statements live on a
+  connection/session, so every pooled connection prepares its own at construction.
+  The schema is created once (idempotent `CREATE IF NOT EXISTS`).
+- **Per-object ordering is still NOT guaranteed.** The pool does not add
+  per-object locking; the tolerated-races table above is unchanged. Last metadata
+  write wins; orphaned shards remain inert. Postgres `ON CONFLICT … DO UPDATE`
+  and `conditional_put` version fencing continue to provide per-row atomicity.
+- **`list()` snapshot consistency is unchanged or better.** Shard locations are
+  now read in the same transaction snapshot as their parent row, rather than via
+  separate per-row reads.
+
+### Restated invariant #1 (pooled)
+
+> **MetadataStore connection isolation** — Each `pqxx::connection` in the pool is
+> used by at most one thread at a time. No connection ever holds two active
+> transactions simultaneously. Concurrent `MetadataStore` operations execute on
+> distinct connections, bounded by the pool size; callers block only when all
+> connections are checked out.
+
+### Consequences of the amendment
+
+- Metadata operations now run with up to `pool_size` concurrency instead of being
+  globally serialized, removing the single-mutex bottleneck. This is measured by
+  the `metadata_benchmark` executable ([cmd/MetadataBenchmarkMain.cpp](../../cmd/MetadataBenchmarkMain.cpp))
+  and visualised in [docs/metrics/03_metadata_scaling.ipynb](../metrics/03_metadata_scaling.ipynb):
+  at 8 concurrent threads, throughput scales from `pool_size=1` (the old
+  serialized behaviour) up with the pool, and the `list()` JOIN stays flat where
+  the per-row N+1 access grows with object count.
+- The pool opens `pool_size` PostgreSQL connections per `MetadataStore` instance;
+  deployments must size `max_connections` accordingly (the default of 4 is well
+  within Postgres defaults).
+- Multi-process deployment is still out of scope (each process has its own pool);
+  the multi-process caveat above is unchanged.
