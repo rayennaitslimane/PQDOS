@@ -9,6 +9,10 @@
 #include <utility>
 #include <vector>
 
+namespace httplib {
+class Client;
+}
+
 using PlacementMap =
     std::unordered_map<std::string, std::vector<std::pair<std::string, Bytes>>>;
 
@@ -22,6 +26,8 @@ struct ParsedShardKey {
 };
 
 std::pair<std::string, int> parse_address(const std::string& address);
+
+httplib::Client& get_node_client(const std::string& node_address);
 
 std::string make_shard_key(
     const std::string& object_id,

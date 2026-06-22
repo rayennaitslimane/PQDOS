@@ -21,8 +21,6 @@ std::pair<std::string, int> parse_address(const std::string& address) {
     return {address.substr(0, pos), std::stoi(address.substr(pos + 1))};
 }
 
-namespace {
-
 httplib::Client& get_node_client(const std::string& node_address) {
     thread_local std::unordered_map<
         std::string,
@@ -48,8 +46,6 @@ httplib::Client& get_node_client(const std::string& node_address) {
 
     return *it->second;
 }
-
-} // namespace
 
 std::string make_shard_key(const std::string& object_id, const std::string& version, uint32_t shard_index) {
     if (object_id.empty() || version.empty()) {
@@ -287,10 +283,7 @@ void remove_from_nodes(const ShardLocationMap& shard_location_map) {
 
 bool probe_shard(const std::string& node_address, const std::string& location) {
     try {
-        auto [host, port] = parse_address(node_address);
-        httplib::Client client(host, port);
-        client.set_connection_timeout(5, 0);
-        client.set_read_timeout(10, 0);
+        auto& client = get_node_client(node_address);
 
         auto res = client.Get("/shards?location=" + location);
         return res && res->status == 200;

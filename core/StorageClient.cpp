@@ -95,10 +95,7 @@ std::string bytes_to_hex(const Bytes& bytes) {
 
 bool is_node_healthy(const std::string& node_address) {
     try {
-        auto [host, port] = parse_address(node_address);
-        httplib::Client client(host, port);
-        client.set_connection_timeout(5, 0);
-        client.set_read_timeout(10, 0);
+        auto& client = get_node_client(node_address);
 
         auto res = client.Get("/health");
         return res && res->status == 200;
@@ -188,10 +185,7 @@ StorageClient::~StorageClient() = default;
 
 void StorageClient::init() {
     for (const auto& node_address : metadata_store_.list_nodes()) {
-        auto [host, port] = parse_address(node_address);
-        httplib::Client client(host, port);
-        client.set_connection_timeout(5, 0);
-        client.set_read_timeout(10, 0);
+        auto& client = get_node_client(node_address);
 
         auto res = client.Get("/health");
 
@@ -256,9 +250,6 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
     auto put_start = std::chrono::steady_clock::now();
 
     // 3) Generate plain shards from bytes
-    Bytes mutable_input = bytes; // encode() takes non-const Bytes&
-    ErasureSpec mutable_spec = erasure_spec; // encode() takes non-const ErasureSpec&
-
     std::vector<PlainShard> plain_shards;
     std::vector<EncryptedShard> encrypted_shards;
     Bytes wrapped_dek;
@@ -267,7 +258,7 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
     {
         ScopedTimer crypto_timer(&crypto_ms);
 
-        plain_shards = encode(mutable_input, mutable_spec);
+        plain_shards = encode(bytes, erasure_spec);
 
         const std::size_t expected_total_shards =
             static_cast<std::size_t>(erasure_spec.data_shards + erasure_spec.parity_shards);
@@ -691,9 +682,7 @@ bool StorageClient::repair(const std::string& object_id) {
                 );
             }
 
-            Bytes mutable_input = decoded;
-            ErasureSpec mutable_spec = metadata.erasure;
-            std::vector<PlainShard> all_plain_shards = encode(mutable_input, mutable_spec);
+            std::vector<PlainShard> all_plain_shards = encode(decoded, metadata.erasure);
 
             // 9) Re-encrypt only the missing shards
             std::vector<PlainShard> missing_plain_shards;

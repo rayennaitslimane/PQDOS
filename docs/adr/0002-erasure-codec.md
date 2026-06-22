@@ -41,14 +41,13 @@ If the final data shard is not full, the remainder is zero-padded to `shard_size
 
 ### Encode signature and ownership
 
-`encode(Bytes& data, ErasureSpec& erasure_spec)` takes both arguments by non-const reference. In practice `encode` only reads `data` - it does not mutate it. The non-const signature forces callers to make a defensive copy:
+`encode(const Bytes& data, const ErasureSpec& erasure_spec)` takes both arguments by const reference. `encode` only reads its inputs - it does not mutate them - so callers pass their buffers directly without copying:
 
 ```cpp
-Bytes mutable_input = bytes;  // StorageClient::put
-std::vector<PlainShard> plain_shards = encode(mutable_input, erasure_spec);
+std::vector<PlainShard> plain_shards = encode(bytes, erasure_spec);  // StorageClient::put
 ```
 
-> **Known inefficiency:** the copy is unnecessary. Changing `encode`'s signature to `const Bytes&` eliminates one full object-sized allocation per write.
+> **Resolved:** the signature previously took `Bytes& data` by non-const reference, which forced callers to make a defensive copy of the full object on every write. Switching to `const Bytes&` removes that full object-sized allocation per write; the `ErasureSpec` argument is const as well, matching `decode`.
 
 ### Shard ordering
 

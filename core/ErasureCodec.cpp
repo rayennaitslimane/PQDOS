@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <vector>
 
-std::vector<PlainShard> encode(Bytes& data, ErasureSpec& erasure_spec) {
+std::vector<PlainShard> encode(const Bytes& data, const ErasureSpec& erasure_spec) {
     const uint32_t k = erasure_spec.data_shards;
     const uint32_t m = erasure_spec.parity_shards;
     const uint32_t n = k + m;

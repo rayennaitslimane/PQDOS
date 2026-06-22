@@ -1,12 +1,13 @@
 .docs
 .env
+.venv/
 /build
 
 CMakeUserPresets.json
 
 # Python cache
-__pycache__/
+__pycache__
 *.py[cod]
 
 # Jupyter
-.ipynb_checkpoints/
+.ipynb_checkpoints

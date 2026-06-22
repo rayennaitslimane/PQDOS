@@ -2,7 +2,7 @@
 
 **Status:** Accepted (amended)  
 **Date:** 2026-06-11  
-**Amended:** 2026-06-15
+**Amended:** 2026-06-22
 
 ## Context
 
@@ -107,11 +107,10 @@ For 3 nodes with equal latencies, this eliminates ~67% of transport time compare
 
 ### Connection reuse and remaining limits
 
-Hot-path transport calls now reuse clients across operations on the same thread (`apply_placement`, `fetch_encrypted_shards`, `remove_from_nodes`) via thread-local per-node caching. This removes repeated client construction overhead on those paths, especially for small payloads (`kShardSize = 20`).
+Hot-path transport calls now reuse clients across operations on the same thread (`apply_placement`, `fetch_encrypted_shards`, `remove_from_nodes`) via thread-local per-node caching. This removes repeated client construction overhead on those paths, especially for small payloads (`kShardSize = 20`). The health-probe and startup paths (`probe_shard`, `is_node_healthy`, and `StorageClient::init()`) share the same `get_node_client` cache, so repair and init no longer rebuild a client on every probe.
 
 Remaining limits:
 - The cache has no explicit eviction; entries live until thread exit.
-- Reuse is currently scoped to shard transport hot paths. Health probes such as `probe_shard` and `StorageClient::init()` still construct short-lived clients.
 
 ### HTTP timeouts
 
@@ -122,7 +121,7 @@ client.set_connection_timeout(5, 0);  // 5 seconds
 client.set_read_timeout(10, 0);       // 10 seconds
 ```
 
-These timeouts are applied in `apply_placement`, `fetch_encrypted_shards`, `remove_from_nodes`, `probe_shard`, and the `init()` health check loop.
+These timeouts are applied wherever a client is created. Because shard transport, the health probes (`probe_shard`, `is_node_healthy`), and the `init()` health check loop all obtain clients through `get_node_client`, the timeouts are configured once per thread-local client and reused on every subsequent call.
 
 ## Consequences
 
@@ -138,7 +137,6 @@ These timeouts are applied in `apply_placement`, `fetch_encrypted_shards`, `remo
 
 **Remaining trade-offs:**
 - Thread-local client caches do not evict entries; a long-lived worker thread that touches many unique node addresses retains those clients until thread exit.
-- Client reuse is not yet applied uniformly across all HTTP call sites (`probe_shard`, `StorageClient::init`, and `is_node_healthy` still use short-lived clients).
 - Versioned writes can leave orphaned shard payloads for write attempts that lose the metadata upsert race, and for same-object `put/remove` interleavings allowed by ADR-0006.
 - Dynamic placement selects the first `k + m` nodes ordered by registration time. No consistent hashing or rebalancing is performed when nodes are added/removed; existing shard locations are not migrated.
 - Repair requires a sufficient number of healthy registered nodes for replacement targets. If too few healthy nodes are available, repair fails before metadata update.
