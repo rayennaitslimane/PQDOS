@@ -130,6 +130,82 @@ storage hygiene and key management rather than raw latency:
    concern, a re-wrap sweep, a keystore backup, and a non-`/tmp` default all come essentially for
    free.
 
+## Security audit: vulnerabilities and fixes
+
+A read-through of the implementation against the ADRs confirms the cryptographic core is sound:
+AES-256-GCM per shard, ML-KEM-768 KEM wrapping, per-shard random nonces, the shard index bound as
+AEAD associated data, and DEK scrubbing are all implemented as
+[ADR-0001](docs/adr/0001-quantum-encryption.md) describes, and SQL is fully parameterized through
+prepared statements in [core/MetadataStore.cpp](core/MetadataStore.cpp) (no injection surface). The
+exploitable risk is not in the math; it is concentrated at the trust boundary, which the ADRs never
+addressed. The findings below are ordered by severity, each with a simple, high-yield fix.
+
+### Critical
+
+- **No authentication or authorization on any endpoint.** Both
+  [core/StorageClientServer.cpp](core/StorageClientServer.cpp) and
+  [core/StorageNodeServer.cpp](core/StorageNodeServer.cpp) register routes with no auth. Anyone
+  with network reach can `GET`/`PUT`/`DELETE`/`list`/`repair` any object, and can `DELETE` raw
+  shards directly on a node. Deleting `k` shards makes an object permanently unrecoverable, an
+  integrity and availability attack erasure coding cannot defend against.
+  *Fix:* add a `set_pre_routing_handler` on both servers that checks a constant-time
+  `Authorization: Bearer <token>` from an environment variable and returns `401` otherwise (~15
+  lines, no new dependency).
+
+### High
+
+- **KEK keystore default is world-readable and creation races.** The default path
+  `/tmp/pqdos_kek.json` in [core/StorageClient.cpp](core/StorageClient.cpp) is a predictable,
+  world-writable location holding the ML-KEM private keys. In `save_kek_file`
+  ([core/Crypto.cpp](core/Crypto.cpp)) the file is created with `std::ofstream` under the process
+  umask and only downgraded to `0600` afterward, leaving a window where the key file is
+  world-readable; the write is also non-atomic, so a crash can leave a truncated keystore.
+  *Fix:* require `PQDOS_KEYSTORE_PATH` (fail closed if unset, drop the `/tmp` default), `umask(077)`
+  or `open(..., O_WRONLY|O_CREAT|O_EXCL, 0600)` before writing, and write to a temp file +
+  `fsync` + `rename` for atomicity.
+- **All traffic is plaintext HTTP.** Both servers use `httplib::Server` over cleartext HTTP/1.1, and
+  the client API carries object plaintext as base64 in PUT/GET bodies
+  ([core/StorageClientServer.cpp](core/StorageClientServer.cpp)). The post-quantum guarantee is
+  at-rest only; on the wire confidentiality is zero.
+  *Fix:* terminate TLS via `httplib::SSLServer`/`SSLClient` (or a TLS reverse proxy / mTLS between
+  client and nodes), paired with the auth token so it is never sent in cleartext.
+
+### Medium
+
+- **Unbounded request body → memory-exhaustion DoS.** The PUT handler base64-decodes the entire
+  body before checking `bytes.size()` against `k * shard_size`, and cpp-httplib's default payload
+  cap is effectively unlimited.
+  *Fix:* call `server_.set_payload_max_length(N)` on both servers.
+- **Deserialization of untrusted node responses (msgpack bomb).** `fetch_encrypted_shards`
+  ([core/ShardTransport.cpp](core/ShardTransport.cpp)) calls `EncryptedShard::deserialize`
+  ([include/Models.hpp](include/Models.hpp)) on bytes returned by a node; a compromised node can
+  return crafted msgpack with huge length prefixes that allocate before the try/catch fails.
+  *Fix:* reject payloads larger than `shard_size` plus a small fixed overhead before deserializing,
+  and apply an `msgpack::unpack` size limit.
+- **Internal error details leaked to clients.** Handlers return `e.what()` verbatim in `500`
+  responses, exposing file paths, node `host:port`, and SQL/LMDB error strings.
+  *Fix:* return a generic `{"error":"internal error"}` body and log details server-side only; also
+  map `GET /objects/:id` not-found to `404` ([ADR-0005](docs/adr/0005-http-surface.md) already
+  flags this).
+- **Unsalted SHA-256 of plaintext stored in metadata.** The `checksum` column holds a SHA-256 of
+  the plaintext, giving anyone with metadata DB access a confirmation oracle for low-entropy or
+  known objects.
+  *Fix:* store an HMAC-SHA-256 (keyed) or hash the ciphertext instead.
+
+### Low
+
+- **`parse_address` uses unchecked `std::stoi`** ([core/ShardTransport.cpp](core/ShardTransport.cpp));
+  a malformed registered address throws and aborts the write path. *Fix:* validate the address
+  format at `register_node` time.
+- **Residual DEK copy not scrubbed.** `recover_dek` in [core/StorageClient.cpp](core/StorageClient.cpp)
+  returns the DEK by value; the function-local copy is not wiped, contrary to ADR-0001's
+  immediate-scrub claim. *Fix:* scrub the local before returning.
+
+The three Critical/High items (authentication, keystore hardening, TLS) are each small changes that
+together bring the running system in line with the confidentiality and integrity goals stated in
+ADR-0001. The ADRs themselves never specify auth or TLS, so this is also an architectural gap worth
+recording, not merely an implementation oversight.
+
 ## Closing thought
 
 PQDOS already delivers the hard parts: post-quantum confidentiality at rest and erasure durability
