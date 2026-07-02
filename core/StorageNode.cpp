@@ -228,3 +228,48 @@ std::vector<std::optional<Bytes>> StorageNode::remove(
 
     return removed_payloads;
 }
+
+std::vector<std::string> StorageNode::list_locations() {
+    MDB_txn* txn = nullptr;
+
+    check_lmdb(
+        mdb_txn_begin(env_, nullptr, MDB_RDONLY, &txn),
+        "mdb_txn_begin"
+    );
+
+    MDB_dbi dbi = open_database(txn);
+
+    MDB_cursor* cursor = nullptr;
+    const int cursor_rc = mdb_cursor_open(txn, dbi, &cursor);
+    if (cursor_rc != 0) {
+        mdb_txn_abort(txn);
+        check_lmdb(cursor_rc, "mdb_cursor_open");
+    }
+
+    std::vector<std::string> locations;
+
+    MDB_val key{};
+    MDB_val value{};
+
+    // Keys only: MDB_NEXT still returns the value pointer into the mmap, but we
+    // never copy it, so enumeration stays cheap regardless of payload size.
+    int rc = mdb_cursor_get(cursor, &key, &value, MDB_FIRST);
+    while (rc == 0) {
+        locations.emplace_back(
+            static_cast<const char*>(key.mv_data),
+            key.mv_size
+        );
+        rc = mdb_cursor_get(cursor, &key, &value, MDB_NEXT);
+    }
+
+    mdb_cursor_close(cursor);
+
+    if (rc != MDB_NOTFOUND) {
+        mdb_txn_abort(txn);
+        check_lmdb(rc, "mdb_cursor_get");
+    }
+
+    mdb_txn_abort(txn);
+
+    return locations;
+}

@@ -245,4 +245,36 @@ TEST_F(StorageNodeServerTest, PutAndGetShardWithStructuredKey) {
     ASSERT_EQ(del_res->status, 200);
 }
 
+TEST_F(StorageNodeServerTest, ListShardsReturnsStoredKeys) {
+    const std::string location =
+        "11111111-1111-1111-1111-111111111111/deadbeefdeadbeef/0";
+    const std::string payload = "list-endpoint-payload";
+
+    auto put_res = client_.Put(
+        shardUri(location),
+        payload,
+        "application/octet-stream"
+    );
+    ASSERT_TRUE(put_res);
+    ASSERT_EQ(put_res->status, 200);
+
+    auto res = client_.Get("/shards/list");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    ASSERT_TRUE(body.is_array());
+
+    bool found = false;
+    for (const auto& entry : body) {
+        if (entry.is_string() && entry.get<std::string>() == location) {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found);
+
+    cleanup(location);
+}
+
 } // namespace

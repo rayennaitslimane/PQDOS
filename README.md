@@ -39,6 +39,7 @@ Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
 | [0005](docs/adr/0005-http-surface.md) | cpp-httplib embedded HTTP server with Base64 object payloads and JSON erasure parameters |
 | [0006](docs/adr/0006-concurrency-contract.md) | Concurrency contract: MetadataStore mutex, KEK ring shared_mutex, tolerated per-object races |
 | [0007](docs/adr/0007-metrics-collector.md) | Inline metrics instrumentation with ScopedTimer, CSV export, benchmark harness |
+| [0008](docs/adr/0008-self-describing-shards.md) | Self-describing shards (per-object manifest replicated onto every shard) with a metadata rebuild path |
 
 
 ## II. Prerequisites
@@ -163,6 +164,23 @@ curl -X POST http://localhost:8080/objects/00000000-0000-0000-0000-000000000001/
 
 Reconstructs missing shards from surviving ones using erasure coding, re-encrypts them with the original DEK (fresh nonces), and places them on eligible nodes. Uses optimistic version fencing and returns `"repaired": false` if a concurrent mutation occurred during repair.
 
+### Rebuild the metadata catalog
+
+```bash
+curl -X POST http://localhost:8080/admin/reindex
+# {
+#   "status": "ok",
+#   "versions_scanned": 12,
+#   "objects_recovered": 10,
+#   "objects_skipped_existing": 2,
+#   "degraded_objects": 0,
+#   "unreadable_versions": 0,
+#   "errors": 0
+# }
+```
+
+Rebuilds the PostgreSQL metadata catalog directly from the self-describing shards on the storage nodes ([ADR-0008](docs/adr/0008-self-describing-shards.md)). Every shard carries a replicated copy of its object's manifest (erasure spec, wrapped DEK, `kek_id`, checksum, size), so the catalog survives a total loss of the metadata database and is fully recoverable from any surviving `k` shards per object. The rebuild scans each node's keyspace, groups shards by object and version, selects the newest reconstructable version, and inserts any missing catalog entries without clobbering existing ones. Intended as an administrative disaster-recovery operation.
+
 
 ## VI. Storage Node API
 
@@ -171,6 +189,7 @@ Used internally by the client. Each node exposes:
 | Method | Route | Body | Description |
 |--------|-------|------|-------------|
 | GET | `/health` | - | Health check |
+| GET | `/shards/list` | - | List all stored shard keys (used by metadata rebuild) |
 | PUT | `/shards?location=<shard_key>` | raw bytes | Store a shard |
 | GET | `/shards?location=<shard_key>` | - | Retrieve a shard |
 | DELETE | `/shards?location=<shard_key>` | - | Delete a shard |

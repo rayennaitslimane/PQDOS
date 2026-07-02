@@ -50,6 +50,7 @@ if(BUILD_TESTING)
     add_executable(pqdos_unit_tests
         tests/ErasureCodecTest.cpp
         tests/CryptoTest.cpp
+        tests/ModelsTest.cpp
     )
 
     target_link_libraries(pqdos_unit_tests PRIVATE

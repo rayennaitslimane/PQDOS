@@ -20,6 +20,16 @@
 #include <string>
 #include <unordered_map>
 
+// Summary of a metadata rebuild pass (ADR-0008). All counts are per invocation.
+struct ReindexReport {
+    std::size_t versions_scanned = 0;        // distinct (object_id, version) groups found
+    std::size_t objects_recovered = 0;       // new catalog rows inserted
+    std::size_t objects_skipped_existing = 0;// objects whose metadata already existed
+    std::size_t degraded_objects = 0;        // recovered with fewer than k shards present
+    std::size_t unreadable_versions = 0;     // groups whose manifest could not be fetched
+    std::size_t errors = 0;                  // objects that failed to persist
+};
+
 class StorageClient {
 public:
     explicit StorageClient(const std::string& metadata_conn_str);
@@ -33,6 +43,13 @@ public:
     void rotate();
     ObjectHealth health(const std::string& object_id);
     bool repair(const std::string& object_id);
+
+    // Rebuild the PostgreSQL metadata catalog from the self-describing shards on
+    // the storage nodes (ADR-0008). Scans every node's keyspace, groups shards
+    // by object/version, recovers each object's manifest, and inserts any
+    // missing catalog entries without clobbering existing ones. Intended as an
+    // administrative disaster-recovery operation.
+    ReindexReport reindex();
 
     MetadataStore& metadata_store() { return metadata_store_; }
     void set_collector(MetricsCollector* c) { collector_ = c; }

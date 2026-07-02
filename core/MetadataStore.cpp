@@ -280,6 +280,70 @@ bool MetadataStore::conditional_put(const ObjectMetadata& metadata, int expected
     return true;
 }
 
+bool MetadataStore::insert_if_absent(const ObjectMetadata& metadata) {
+    auto conn = acquire();
+    validate_metadata(metadata);
+
+    pqxx::work tx{*conn};
+
+    const std::int64_t object_size = checked_size_to_i64(metadata.size);
+    const Bytes erasure_bytes = metadata.erasure.serialize();
+
+    if (erasure_bytes.empty()) {
+        throw std::invalid_argument("ObjectMetadata.erasure serialized to an empty buffer");
+    }
+
+    pqxx::bytes erasure_blob;
+    erasure_blob.reserve(erasure_bytes.size());
+    for (const auto byte : erasure_bytes) {
+        erasure_blob.push_back(static_cast<std::byte>(byte));
+    }
+
+    pqxx::bytes encrypted_dek_blob;
+    encrypted_dek_blob.reserve(metadata.encrypted_dek.size());
+    for (const auto byte : metadata.encrypted_dek) {
+        encrypted_dek_blob.push_back(static_cast<std::byte>(byte));
+    }
+
+    pqxx::result result = tx.exec(
+        pqxx::prepped{"insert_if_absent_object_metadata"},
+        pqxx::params{
+            metadata.id,
+            object_size,
+            metadata.checksum,
+            erasure_blob,
+            encrypted_dek_blob,
+            metadata.kek_id
+        }
+    );
+
+    // ON CONFLICT DO NOTHING ... RETURNING id yields zero rows when a row
+    // already existed; in that case the existing catalog entry is authoritative
+    // and we must not touch its shard locations.
+    if (result.empty()) {
+        tx.commit();
+        return false;
+    }
+
+    for (std::size_t i = 0; i < metadata.shard_locations.size(); ++i) {
+        if (i > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::overflow_error("Too many shard locations for INTEGER shard_index");
+        }
+
+        tx.exec(
+            pqxx::prepped{"insert_object_shard_location"},
+            pqxx::params{
+                metadata.id,
+                static_cast<std::int32_t>(i),
+                metadata.shard_locations[i]
+            }
+        );
+    }
+
+    tx.commit();
+    return true;
+}
+
 void MetadataStore::register_node(const std::string& address) {
     auto conn = acquire();
     pqxx::work tx{*conn};
@@ -355,6 +419,32 @@ void MetadataStore::prepare_statements(pqxx::connection& conn) {
                 kek_id = EXCLUDED.kek_id,
                 version = object_metadata.version + 1
             RETURNING version
+        )SQL"
+    );
+
+    conn.prepare(
+        "insert_if_absent_object_metadata",
+        R"SQL(
+            INSERT INTO object_metadata (
+                id,
+                size,
+                checksum,
+                erasure_spec,
+                encrypted_dek,
+                kek_id,
+                version
+            )
+            VALUES (
+                $1::uuid,
+                $2,
+                $3,
+                $4::bytea,
+                $5::bytea,
+                $6,
+                1
+            )
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
         )SQL"
     );
 

@@ -248,4 +248,27 @@ void StorageClientServer::setup_routes() {
         body["repaired"] = repaired;
         res.set_content(body.dump(), "application/json");
     });
+
+    server_.Post("/admin/reindex", [this](const httplib::Request& /*req*/, httplib::Response& res) {
+        ReindexReport report;
+        try {
+            report = client_.reindex();
+        } catch (const std::exception& e) {
+            nlohmann::json body;
+            body["error"] = e.what();
+            res.status = 500;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        nlohmann::json body;
+        body["status"] = "ok";
+        body["versions_scanned"] = report.versions_scanned;
+        body["objects_recovered"] = report.objects_recovered;
+        body["objects_skipped_existing"] = report.objects_skipped_existing;
+        body["degraded_objects"] = report.degraded_objects;
+        body["unreadable_versions"] = report.unreadable_versions;
+        body["errors"] = report.errors;
+        res.set_content(body.dump(), "application/json");
+    });
 }

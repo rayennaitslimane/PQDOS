@@ -111,6 +111,23 @@ protected:
         tx.commit();
     }
 
+    // Wipe only the metadata catalog, preserving the node registry. Simulates
+    // a total loss of the PostgreSQL object tables while the shards on the
+    // storage nodes survive (the disaster the ADR-0008 rebuild path addresses).
+    void clearObjectMetadata() {
+        pqxx::connection conn{connStr_};
+        pqxx::work tx{conn};
+
+        tx.exec(R"SQL(
+            TRUNCATE TABLE
+                object_shard_locations,
+                object_metadata
+            CASCADE
+        )SQL");
+
+        tx.commit();
+    }
+
     StorageClient& client() { return *client_; }
 
     std::string connStr_;
@@ -1000,6 +1017,106 @@ TEST_F(StorageClientTest, PutRejectsPayloadExceedingKTimesShardSize) {
         client().put("00000000-0000-0000-0000-000000006005", oversized, spec),
         std::invalid_argument
     );
+}
+
+// ===========================================================================
+// Metadata rebuild (ADR-0008): reconstruct the catalog from self-describing
+// shards after a total loss of the PostgreSQL object tables.
+// ===========================================================================
+
+TEST_F(StorageClientTest, ReindexRebuildsCatalogAfterMetadataLoss) {
+    const std::string id1 = "00000000-0000-0000-0000-000000007001";
+    const std::string id2 = "00000000-0000-0000-0000-000000007002";
+    const std::string payload1 = "rebuild me from the shards themselves";
+    const std::string payload2 = "second object survives the wipe too";
+
+    client().put(id1, ToBytes(payload1), TestErasureSpec());
+    client().put(id2, ToBytes(payload2), TestErasureSpec());
+
+    // Simulate catalog loss while shards on nodes survive.
+    clearObjectMetadata();
+    ASSERT_TRUE(client().list().empty());
+
+    ReindexReport report = client().reindex();
+    EXPECT_GE(report.objects_recovered, 2u);
+    EXPECT_EQ(report.errors, 0u);
+
+    const auto items = client().list();
+    EXPECT_TRUE(ContainsObjectId(items, id1));
+    EXPECT_TRUE(ContainsObjectId(items, id2));
+
+    // Objects are fully readable again purely from rebuilt metadata.
+    EXPECT_EQ(ToString(client().get(id1)), payload1);
+    EXPECT_EQ(ToString(client().get(id2)), payload2);
+
+    const ObjectMetadata* meta = FindObjectMetadata(items, id1);
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->size, payload1.size());
+    EXPECT_EQ(meta->shard_locations.size(), 3u);
+}
+
+TEST_F(StorageClientTest, ReindexDoesNotClobberExistingMetadata) {
+    const std::string object_id = "00000000-0000-0000-0000-000000007003";
+    const std::string payload = "live metadata must win over rebuild";
+
+    client().put(object_id, ToBytes(payload), TestErasureSpec());
+
+    const auto items_before = client().list();
+    const ObjectMetadata* before = FindObjectMetadata(items_before, object_id);
+    ASSERT_NE(before, nullptr);
+    const std::vector<std::string> locations_before = before->shard_locations;
+
+    // Metadata for this object is still present; reindex must skip it (ON
+    // CONFLICT DO NOTHING), never overwrite it.
+    ReindexReport report = client().reindex();
+
+    EXPECT_GE(report.objects_skipped_existing, 1u);
+
+    // The live object's metadata and data are untouched.
+    const auto items_after = client().list();
+    const ObjectMetadata* after = FindObjectMetadata(items_after, object_id);
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->shard_locations, locations_before);
+    EXPECT_EQ(ToString(client().get(object_id)), payload);
+}
+
+TEST_F(StorageClientTest, ReindexRecoversDegradedObjectAsRepairable) {
+    const std::string object_id = "00000000-0000-0000-0000-000000007004";
+    const std::string payload = "degraded but recoverable object";
+
+    client().put(object_id, ToBytes(payload), TestErasureSpec());
+
+    // Drop one shard (k=2, m=1 → still recoverable) then lose the catalog.
+    const auto items = client().list();
+    const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
+    ASSERT_NE(meta, nullptr);
+    const std::string victim = meta->shard_locations.front();
+    const auto slash = victim.find('/');
+    ASSERT_NE(slash, std::string::npos);
+    const std::string node_address = victim.substr(0, slash);
+    const std::string location = victim.substr(slash + 1);
+
+    const auto colon = node_address.rfind(':');
+    ASSERT_NE(colon, std::string::npos);
+    const std::string host = node_address.substr(0, colon);
+    const int port = std::atoi(node_address.substr(colon + 1).c_str());
+
+    httplib::Client node_client(host, port);
+    node_client.Delete("/shards?location=" + location);
+
+    clearObjectMetadata();
+
+    ReindexReport report = client().reindex();
+    EXPECT_GE(report.objects_recovered, 1u);
+
+    // Object is still reconstructable from the surviving shards.
+    EXPECT_EQ(ToString(client().get(object_id)), payload);
+
+    // And the rebuilt (degraded) metadata is repairable back to full health.
+    bool repaired = false;
+    EXPECT_NO_THROW(repaired = client().repair(object_id));
+    EXPECT_TRUE(repaired);
+    EXPECT_TRUE(client().health(object_id).healthy);
 }
 
 }  // namespace

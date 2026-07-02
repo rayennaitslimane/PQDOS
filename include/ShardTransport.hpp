@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -54,6 +55,18 @@ ShardLocationMap parse_shard_locations(
 
 std::vector<EncryptedShard> fetch_encrypted_shards(
     const ShardLocationMap& shard_location_map
+);
+
+// Enumerate every shard key stored on a node via GET /shards/list. Returns the
+// shard keys (object_id/version/shard_index) without the node prefix. Used by
+// the metadata rebuild path (ADR-0008). Returns empty on transport failure.
+std::vector<std::string> list_node_shards(const std::string& node_address);
+
+// Fetch a single stored shard and return its embedded manifest, if present.
+// Returns nullopt on transport failure or for legacy payloads with no manifest.
+std::optional<ShardManifest> fetch_shard_manifest(
+    const std::string& node_address,
+    const std::string& location
 );
 
 void remove_from_nodes(const ShardLocationMap& shard_location_map);

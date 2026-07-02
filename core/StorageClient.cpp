@@ -10,14 +10,18 @@
 #include <httplib.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <iomanip>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -28,6 +32,12 @@ namespace {
 // =========================
 
 const std::string kDefaultKekFilePath = "/tmp/pqdos_kek.json";
+
+// Sentinel node address recorded for shards that were missing at rebuild time
+// (ADR-0008). It is structurally valid ("host:port") so it round-trips through
+// metadata and parsing, but is unreachable, so health/repair treat it as a
+// missing shard and repair relocates it to a live node.
+const std::string kUnknownNode = "0.0.0.0:0";
 
 std::string parseKekFilePath() {
     const char* env = std::getenv("PQDOS_KEYSTORE_PATH");
@@ -76,6 +86,14 @@ std::string generateVersion() {
     }
 
     return version;
+}
+
+std::uint64_t now_unix_nanos() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count()
+    );
 }
 
 // =========================
@@ -255,6 +273,11 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
     Bytes wrapped_dek;
     std::vector<Bytes> serialized_shards;
 
+    // Version token for this write; embedded in shard keys and in each shard's
+    // self-describing manifest (ADR-0008) so a rebuild can group and disambiguate.
+    const std::string version = generateVersion();
+    std::string used_kek_id;
+
     {
         ScopedTimer crypto_timer(&crypto_ms);
 
@@ -284,18 +307,33 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
 
         {
             std::shared_lock<std::shared_mutex> kek_lock(kek_mu_);
-            wrapped_dek = encrypt_dek(dek, *kek_ring_.at(active_kek_id_)->public_key());
+            used_kek_id = active_kek_id_;
+            wrapped_dek = encrypt_dek(dek, *kek_ring_.at(used_kek_id)->public_key());
         }
         Botan::secure_scrub_memory(dek.data(), dek.size());
 
+        // Build the per-object manifest replicated onto every shard so the
+        // metadata catalog can be rebuilt from the nodes alone (ADR-0008).
+        ShardManifest manifest;
+        manifest.object_id = object_id;
+        manifest.version = version;
+        manifest.size = bytes.size();
+        manifest.checksum = checksum_hex;
+        manifest.erasure = erasure_spec;
+        manifest.encrypted_dek = wrapped_dek;
+        manifest.kek_id = used_kek_id;
+        manifest.written_at = now_unix_nanos();
+
         serialized_shards.reserve(encrypted_shards.size());
         for (const auto& encrypted_shard : encrypted_shards) {
-            serialized_shards.push_back(encrypted_shard.serialize());
+            StoredShard stored;
+            stored.manifest = manifest;
+            stored.shard = encrypted_shard;
+            serialized_shards.push_back(stored.serialize());
         }
     }
 
     // 5) placement_strategy(serialized_shards)
-    const std::string version = generateVersion();
     PlacementMap placement = placement_strategy(object_id, version, serialized_shards, eligible_nodes);
 
     // 6) apply_placement(map) over HTTP
@@ -312,7 +350,7 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
     metadata.erasure = erasure_spec;
     metadata.shard_locations = build_shard_locations(placement);
     metadata.encrypted_dek = wrapped_dek;
-    metadata.kek_id = active_kek_id_;
+    metadata.kek_id = used_kek_id;
 
     {
         ScopedTimer metadata_timer(&metadata_ms);
@@ -769,8 +807,25 @@ bool StorageClient::repair(const std::string& object_id) {
         // Write repaired shards
         std::vector<Bytes> serialized_repaired;
         serialized_repaired.reserve(repaired_encrypted.size());
+
+        // Repaired shards stay self-describing: rebuild the manifest from the
+        // loaded metadata so a future rebuild can recover this object even from
+        // the replacement shards alone (ADR-0008).
+        ShardManifest repaired_manifest;
+        repaired_manifest.object_id = object_id;
+        repaired_manifest.version = version;
+        repaired_manifest.size = metadata.size;
+        repaired_manifest.checksum = metadata.checksum;
+        repaired_manifest.erasure = metadata.erasure;
+        repaired_manifest.encrypted_dek = metadata.encrypted_dek;
+        repaired_manifest.kek_id = metadata.kek_id;
+        repaired_manifest.written_at = now_unix_nanos();
+
         for (const auto& es : repaired_encrypted) {
-            serialized_repaired.push_back(es.serialize());
+            StoredShard stored;
+            stored.manifest = repaired_manifest;
+            stored.shard = es;
+            serialized_repaired.push_back(stored.serialize());
         }
 
         PlacementMap repair_placement;
@@ -818,4 +873,197 @@ bool StorageClient::repair(const std::string& object_id) {
         record_repair(false);
         throw;
     }
+}
+
+ReindexReport StorageClient::reindex() {
+    ReindexReport report;
+
+    const std::vector<std::string> nodes = metadata_store_.list_nodes();
+
+    // 1) Scan every node's keyspace in parallel. Keys alone reconstruct shard
+    //    placement, so no payloads are read in this phase.
+    std::vector<std::future<std::pair<std::string, std::vector<std::string>>>> scan_futures;
+    scan_futures.reserve(nodes.size());
+    for (const auto& node : nodes) {
+        scan_futures.push_back(std::async(std::launch::async,
+            [node]() {
+                return std::make_pair(node, list_node_shards(node));
+            }
+        ));
+    }
+
+    // Group discovered shards by (object_id, version). Each group tracks the
+    // full location per shard index plus a representative shard to fetch the
+    // manifest from.
+    struct VersionGroup {
+        std::string object_id;
+        std::string version;
+        std::map<uint32_t, std::string> shard_locations; // index -> "node/key"
+        std::string rep_node;
+        std::string rep_key;
+    };
+
+    std::unordered_map<std::string, VersionGroup> groups;
+
+    for (auto& future : scan_futures) {
+        auto [node, keys] = future.get();
+        for (const auto& key : keys) {
+            ParsedShardKey parsed;
+            try {
+                parsed = parse_shard_key(key);
+            } catch (...) {
+                continue; // ignore keys that are not object shards
+            }
+
+            const std::string gid = parsed.object_id + "/" + parsed.version;
+            VersionGroup& group = groups[gid];
+            if (group.object_id.empty()) {
+                group.object_id = parsed.object_id;
+                group.version = parsed.version;
+                group.rep_node = node;
+                group.rep_key = key;
+            }
+            group.shard_locations[parsed.shard_index] = node + "/" + key;
+        }
+    }
+
+    report.versions_scanned = groups.size();
+
+    // 2) Fetch exactly one manifest per version group in parallel (all shards of
+    //    a group carry the same manifest).
+    std::vector<std::string> gids;
+    gids.reserve(groups.size());
+    for (const auto& [gid, group] : groups) {
+        gids.push_back(gid);
+    }
+
+    std::vector<std::future<std::optional<ShardManifest>>> manifest_futures;
+    manifest_futures.reserve(gids.size());
+    for (const auto& gid : gids) {
+        const VersionGroup& group = groups[gid];
+        const std::string node = group.rep_node;
+        const std::string key = group.rep_key;
+        manifest_futures.push_back(std::async(std::launch::async,
+            [node, key]() {
+                return fetch_shard_manifest(node, key);
+            }
+        ));
+    }
+
+    // 3) Choose one winning version per object: prefer the newest reconstructable
+    //    version (>= k surviving shards). If none is reconstructable, fall back to
+    //    the version with the most surviving shards, newest breaking ties.
+    struct Candidate {
+        ShardManifest manifest;
+        const VersionGroup* group = nullptr;
+        std::size_t shard_count = 0;
+    };
+    std::unordered_map<std::string, Candidate> winners;
+
+    for (std::size_t i = 0; i < gids.size(); ++i) {
+        std::optional<ShardManifest> manifest = manifest_futures[i].get();
+        if (!manifest.has_value()) {
+            ++report.unreadable_versions;
+            continue;
+        }
+
+        // Guard against corrupt or hostile manifests (a compromised node could
+        // return a crafted payload). Reject anything outside the system's own
+        // erasure bounds before it is used to size allocations.
+        const uint32_t k = manifest->erasure.data_shards;
+        const uint32_t m = manifest->erasure.parity_shards;
+        if (k == 0 || m == 0 ||
+            static_cast<std::size_t>(k) + m > 255 ||
+            manifest->erasure.shard_size == 0) {
+            ++report.unreadable_versions;
+            continue;
+        }
+
+        const VersionGroup& group = groups[gids[i]];
+        const std::size_t count = group.shard_locations.size();
+
+        auto it = winners.find(group.object_id);
+        if (it == winners.end()) {
+            winners.emplace(group.object_id, Candidate{*manifest, &group, count});
+            continue;
+        }
+
+        // Selection policy: prefer the newest version that is still
+        // reconstructable (>= k surviving shards) so a rebuild restores the most
+        // recent valid data rather than resurrecting a stale overwritten
+        // version. Only when no version reaches k do we fall back to the one
+        // with the most surviving shards (best effort), newest breaking ties.
+        const Candidate& current = it->second;
+        const bool new_recoverable = count >= manifest->erasure.data_shards;
+        const bool cur_recoverable =
+            current.shard_count >= current.manifest.erasure.data_shards;
+
+        bool better;
+        if (new_recoverable != cur_recoverable) {
+            better = new_recoverable;
+        } else if (new_recoverable) {
+            better = manifest->written_at > current.manifest.written_at;
+        } else {
+            better =
+                count > current.shard_count ||
+                (count == current.shard_count &&
+                 manifest->written_at > current.manifest.written_at);
+        }
+
+        if (better) {
+            it->second = Candidate{*manifest, &group, count};
+        }
+    }
+
+    // 4) Rebuild each object's metadata and insert it without clobbering any
+    //    existing (live or newer) catalog entry.
+    for (const auto& [object_id, candidate] : winners) {
+        const ShardManifest& manifest = candidate.manifest;
+        const std::size_t total = static_cast<std::size_t>(
+            manifest.erasure.data_shards + manifest.erasure.parity_shards);
+
+        ObjectMetadata metadata;
+        metadata.id = object_id;
+        metadata.size = static_cast<std::size_t>(manifest.size);
+        metadata.checksum = manifest.checksum;
+        metadata.erasure = manifest.erasure;
+        metadata.encrypted_dek = manifest.encrypted_dek;
+        metadata.kek_id = manifest.kek_id;
+
+        // Full positional location vector (index == position). Missing shards get
+        // an unreachable sentinel so the object stays valid and repairable.
+        metadata.shard_locations.assign(total, std::string());
+        for (std::size_t idx = 0; idx < total; ++idx) {
+            auto found = candidate.group->shard_locations.find(
+                static_cast<uint32_t>(idx));
+            if (found != candidate.group->shard_locations.end()) {
+                metadata.shard_locations[idx] = found->second;
+            } else {
+                metadata.shard_locations[idx] =
+                    kUnknownNode + "/" +
+                    make_shard_key(object_id, manifest.version,
+                                   static_cast<uint32_t>(idx));
+            }
+        }
+
+        bool inserted = false;
+        try {
+            inserted = metadata_store_.insert_if_absent(metadata);
+        } catch (...) {
+            ++report.errors;
+            continue;
+        }
+
+        if (!inserted) {
+            ++report.objects_skipped_existing;
+            continue;
+        }
+
+        ++report.objects_recovered;
+        if (candidate.shard_count < total) {
+            ++report.degraded_objects;
+        }
+    }
+
+    return report;
 }

@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -324,6 +325,49 @@ TEST_F(StorageNodeTest, PutThrowsWhenLocationsAndPayloadsSizesDiffer) {
         ),
         std::exception
     );
+}
+
+TEST_F(StorageNodeTest, ListLocationsReturnsAllStoredKeys) {
+    StorageNode node(dbPath().c_str());
+
+    const std::vector<std::string> locations = {
+        "obj-a/v1/0",
+        "obj-a/v1/1",
+        "obj-b/v2/0"
+    };
+    const std::vector<Bytes> payloads = {
+        bytes({1}),
+        bytes({2}),
+        bytes({3})
+    };
+
+    node.put(locations, payloads);
+
+    std::vector<std::string> listed = node.list_locations();
+    std::sort(listed.begin(), listed.end());
+
+    std::vector<std::string> expected = locations;
+    std::sort(expected.begin(), expected.end());
+
+    EXPECT_EQ(listed, expected);
+}
+
+TEST_F(StorageNodeTest, ListLocationsIsEmptyForFreshNode) {
+    StorageNode node(dbPath().c_str());
+
+    EXPECT_TRUE(node.list_locations().empty());
+}
+
+TEST_F(StorageNodeTest, ListLocationsExcludesRemovedKeys) {
+    StorageNode node(dbPath().c_str());
+
+    node.put({"keep/v/0", "drop/v/0"}, {bytes({1}), bytes({2})});
+    node.remove({"drop/v/0"});
+
+    const std::vector<std::string> listed = node.list_locations();
+
+    ASSERT_EQ(listed.size(), 1u);
+    EXPECT_EQ(listed[0], "keep/v/0");
 }
 
 } // namespace

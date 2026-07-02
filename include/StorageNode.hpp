@@ -41,4 +41,9 @@ public:
     std::vector<std::optional<Bytes>> remove(
         const std::vector<std::string>& locations
     );
+
+    // Enumerate every shard key currently stored in this node's LMDB
+    // environment. Used by the metadata rebuild path (ADR-0008) to rediscover
+    // shard placement without reading payloads. Read-only cursor scan.
+    std::vector<std::string> list_locations();
 };

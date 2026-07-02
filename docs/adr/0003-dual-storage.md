@@ -3,6 +3,14 @@
 **Status:** Accepted  
 **Date:** 2026-06-11
 
+> **Amendment (2026-07-02):** The PostgreSQL metadata store is no longer the sole
+> authoritative index. Under [ADR-0008](0008-self-describing-shards.md) every
+> shard carries a replicated copy of its object's manifest, so the catalog can be
+> rebuilt from the storage nodes after a total loss of the metadata database. The
+> PostgreSQL store is now best understood as a fast, queryable *cache* of a
+> catalog whose ground truth is distributed across the RAIN array. The
+> `object_metadata` schema below is unchanged.
+
 ## Context
 
 The system manages two fundamentally different categories of data:

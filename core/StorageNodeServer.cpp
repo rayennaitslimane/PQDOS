@@ -33,6 +33,27 @@ void StorageNodeServer::setup_routes() {
         res.set_content(body.dump(), "application/json");
     });
 
+    server_.Get("/shards/list", [this](const httplib::Request& /*req*/, httplib::Response& res) {
+        std::vector<std::string> locations;
+
+        try {
+            locations = node_.list_locations();
+        } catch (const std::exception& e) {
+            nlohmann::json body;
+            body["error"] = e.what();
+            res.status = 500;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        nlohmann::json body = nlohmann::json::array();
+        for (const auto& location : locations) {
+            body.push_back(location);
+        }
+
+        res.set_content(body.dump(), "application/json");
+    });
+
     server_.Put("/shards", [this](const httplib::Request& req, httplib::Response& res) {
         const std::string location = req.has_param("location")
             ? req.get_param_value("location")

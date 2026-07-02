@@ -21,6 +21,12 @@ public:
 
     bool conditional_put(const ObjectMetadata& metadata, int expected_version);
 
+    // Insert metadata only if no row exists for this object id (INSERT ... ON
+    // CONFLICT DO NOTHING). Returns true if a new row was created, false if one
+    // already existed. Used by the metadata rebuild path (ADR-0008) so a
+    // reindex never clobbers live or newer catalog entries.
+    bool insert_if_absent(const ObjectMetadata& metadata);
+
     std::optional<ObjectMetadata> get(const std::string& id);
 
     bool remove(const std::string& id);

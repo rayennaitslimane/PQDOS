@@ -14,3 +14,4 @@ Each ADR documents a significant design choice: its context, the decision made, 
 | [0005](0005-http-surface.md) | HTTP Surface | Accepted |
 | [0006](0006-concurrency-contract.md) | Concurrency Contract | Accepted (amended) |
 | [0007](0007-metrics-collector.md) | Metrics Collector | Accepted |
+| [0008](0008-self-describing-shards.md) | Self-Describing Shards and Metadata Rebuild | Accepted |

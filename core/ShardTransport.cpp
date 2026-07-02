@@ -1,6 +1,7 @@
 #include "ShardTransport.hpp"
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <cstdlib>
 #include <future>
@@ -218,8 +219,12 @@ std::vector<EncryptedShard> fetch_encrypted_shards(
                         Bytes payload(res->body.begin(), res->body.end());
 
                         try {
+                            // Stored payloads are self-describing StoredShard
+                            // envelopes (ADR-0008); decode_shard also tolerates
+                            // legacy bare EncryptedShard payloads. Only the
+                            // encrypted shard is needed on the read path.
                             shards.push_back(
-                                EncryptedShard::deserialize(payload)
+                                StoredShard::decode_shard(payload).first
                             );
                         } catch (...) {
                             continue;
@@ -245,6 +250,54 @@ std::vector<EncryptedShard> fetch_encrypted_shards(
     }
 
     return encrypted_shards;
+}
+
+std::vector<std::string> list_node_shards(const std::string& node_address) {
+    std::vector<std::string> locations;
+
+    try {
+        auto& client = get_node_client(node_address);
+
+        auto res = client.Get("/shards/list");
+        if (!res || res->status != 200) {
+            return locations;
+        }
+
+        nlohmann::json parsed = nlohmann::json::parse(res->body, nullptr, false);
+        if (!parsed.is_array()) {
+            return locations;
+        }
+
+        locations.reserve(parsed.size());
+        for (const auto& entry : parsed) {
+            if (entry.is_string()) {
+                locations.push_back(entry.get<std::string>());
+            }
+        }
+    } catch (...) {
+        locations.clear();
+    }
+
+    return locations;
+}
+
+std::optional<ShardManifest> fetch_shard_manifest(
+    const std::string& node_address,
+    const std::string& location
+) {
+    try {
+        auto& client = get_node_client(node_address);
+
+        auto res = client.Get("/shards?location=" + location);
+        if (!res || res->status != 200) {
+            return std::nullopt;
+        }
+
+        Bytes payload(res->body.begin(), res->body.end());
+        return StoredShard::decode_shard(payload).second;
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 void remove_from_nodes(const ShardLocationMap& shard_location_map) {
