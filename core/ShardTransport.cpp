@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 std::pair<std::string, int> parse_address(const std::string& address) {
@@ -344,3 +345,95 @@ bool probe_shard(const std::string& node_address, const std::string& location) {
         return false;
     }
 }
+
+std::optional<Bytes> fetch_raw_shard(
+    const std::string& node_address,
+    const std::string& location
+) {
+    try {
+        auto& client = get_node_client(node_address);
+
+        auto res = client.Get("/shards?location=" + location);
+        if (!res || res->status != 200) {
+            return std::nullopt;
+        }
+
+        return Bytes(res->body.begin(), res->body.end());
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+namespace {
+
+// FNV-1a 64-bit hash. Deterministic and portable across platforms, so the HRW
+// placement it feeds is stable for a given (object, shard, node) tuple.
+uint64_t fnv1a64(const std::string& data) {
+    constexpr uint64_t kOffsetBasis = 1469598103934665603ULL;
+    constexpr uint64_t kPrime = 1099511628211ULL;
+
+    uint64_t hash = kOffsetBasis;
+    for (const unsigned char byte : data) {
+        hash ^= static_cast<uint64_t>(byte);
+        hash *= kPrime;
+    }
+    return hash;
+}
+
+// Rendezvous weight for placing a given shard of an object on a node.
+uint64_t hrw_weight(
+    const std::string& object_id,
+    std::size_t shard_index,
+    const std::string& node_address
+) {
+    return fnv1a64(object_id + "|" + std::to_string(shard_index) + "|" + node_address);
+}
+
+}  // namespace
+
+std::vector<std::string> hrw_intended_nodes(
+    const std::string& object_id,
+    const std::vector<std::string>& eligible_nodes,
+    std::size_t total_shards
+) {
+    if (eligible_nodes.size() < total_shards) {
+        throw std::runtime_error(
+            "hrw_intended_nodes: not enough eligible nodes for number of shards"
+        );
+    }
+
+    std::vector<std::string> intended;
+    intended.reserve(total_shards);
+
+    std::unordered_set<std::string> assigned;
+    assigned.reserve(total_shards);
+
+    for (std::size_t shard_index = 0; shard_index < total_shards; ++shard_index) {
+        const std::string* best_node = nullptr;
+        uint64_t best_weight = 0;
+
+        for (const std::string& node : eligible_nodes) {
+            if (assigned.count(node) > 0) {
+                continue;
+            }
+
+            const uint64_t weight = hrw_weight(object_id, shard_index, node);
+
+            // Tie-break on node address for determinism when weights collide.
+            if (best_node == nullptr ||
+                weight > best_weight ||
+                (weight == best_weight && node < *best_node)) {
+                best_node = &node;
+                best_weight = weight;
+            }
+        }
+
+        // Guaranteed non-null: eligible_nodes.size() >= total_shards and at most
+        // shard_index nodes are already assigned.
+        intended.push_back(*best_node);
+        assigned.insert(*best_node);
+    }
+
+    return intended;
+}
+

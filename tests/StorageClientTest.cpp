@@ -3,6 +3,7 @@
 #include <pqxx/pqxx>
 
 #include "StorageClient.hpp"
+#include "ShardTransport.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -335,9 +336,10 @@ TEST_F(StorageClientTest, GetSucceedsWithOneShardDeleted) {
     const std::string& loc0 = meta->shard_locations[0];
     const std::string shard_path = loc0.substr(loc0.find('/') + 1);
 
-    // Directly delete shard 0 from node on port 9001
+    // Directly delete shard 0 from its actual (HRW-placed) node
     {
-        httplib::Client node0("localhost", 9001);
+        auto [host, port] = parse_address(loc0.substr(0, loc0.find('/')));
+        httplib::Client node0(host, port);
         auto res = node0.Delete("/shards?location=" + shard_path);
         ASSERT_TRUE(res);
         ASSERT_EQ(res->status, 200);
@@ -514,9 +516,10 @@ TEST_F(StorageClientTest, GetCompletesWithMissingShardInBoundedTime) {
     const std::string& loc2 = meta->shard_locations[2];
     const std::string shard_path = loc2.substr(loc2.find('/') + 1);
 
-    // Delete shard 2 from node on port 9003 - simulates unavailable shard
+    // Delete shard 2 from its actual (HRW-placed) node - simulates unavailable shard
     {
-        httplib::Client node2("localhost", 9003);
+        auto [host, port] = parse_address(loc2.substr(0, loc2.find('/')));
+        httplib::Client node2(host, port);
         auto res = node2.Delete("/shards?location=" + shard_path);
         ASSERT_TRUE(res);
         ASSERT_EQ(res->status, 200);
@@ -818,7 +821,7 @@ TEST_F(StorageClientTest, HealthReportsDegradedAfterShardLoss) {
     const std::string object_id = "00000000-0000-0000-0000-000000005002";
     client().put(object_id, ToBytes("degraded-health-test"), TestErasureSpec());
 
-    // Delete shard 0 from node 9001
+    // Delete shard 0 from its actual (HRW-placed) node
     const auto items = client().list();
     const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
     ASSERT_NE(meta, nullptr);
@@ -828,7 +831,8 @@ TEST_F(StorageClientTest, HealthReportsDegradedAfterShardLoss) {
     const std::string shard_path = loc0.substr(loc0.find('/') + 1);
 
     {
-        httplib::Client node0("localhost", 9001);
+        auto [host, port] = parse_address(loc0.substr(0, loc0.find('/')));
+        httplib::Client node0(host, port);
         auto res = node0.Delete("/shards?location=" + shard_path);
         ASSERT_TRUE(res);
         ASSERT_EQ(res->status, 200);
@@ -864,7 +868,8 @@ TEST_F(StorageClientTest, RepairRestoresMissingShard) {
     const std::string shard_path = loc0.substr(loc0.find('/') + 1);
 
     {
-        httplib::Client node0("localhost", 9001);
+        auto [host, port] = parse_address(loc0.substr(0, loc0.find('/')));
+        httplib::Client node0(host, port);
         auto res = node0.Delete("/shards?location=" + shard_path);
         ASSERT_TRUE(res);
         ASSERT_EQ(res->status, 200);
@@ -931,7 +936,7 @@ TEST_F(StorageClientTest, RepairSkipsDownButRegisteredNodes) {
     const std::string payload = "repair-skip-down-registered";
     client().put(object_id, ToBytes(payload), TestErasureSpec());
 
-    // Delete shard 0 from node 9001 so repair has one missing shard.
+    // Delete shard 0 from its actual (HRW-placed) node so repair has one missing shard.
     const auto items = client().list();
     const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
     ASSERT_NE(meta, nullptr);
@@ -939,9 +944,11 @@ TEST_F(StorageClientTest, RepairSkipsDownButRegisteredNodes) {
 
     const std::string& loc0 = meta->shard_locations[0];
     const std::string shard_path = loc0.substr(loc0.find('/') + 1);
+    const std::string shard0_node = loc0.substr(0, loc0.find('/'));
 
     {
-        httplib::Client node0("localhost", 9001);
+        auto [host, port] = parse_address(shard0_node);
+        httplib::Client node0(host, port);
         auto res = node0.Delete("/shards?location=" + shard_path);
         ASSERT_TRUE(res);
         ASSERT_EQ(res->status, 200);
@@ -950,10 +957,10 @@ TEST_F(StorageClientTest, RepairSkipsDownButRegisteredNodes) {
     ObjectHealth h_before = client().health(object_id);
     ASSERT_FALSE(h_before.fully_replicated);
 
-    // Keep one down-but-registered node in the registry and remove 9001
-    // to force repair candidate selection to include a dead endpoint if
-    // health filtering is missing.
-    EXPECT_TRUE(client().metadata_store().unregister_node("localhost:9001"));
+    // Keep one down-but-registered node in the registry and remove the node that
+    // held shard 0 to force repair candidate selection to include a dead endpoint
+    // if health filtering is missing.
+    EXPECT_TRUE(client().metadata_store().unregister_node(shard0_node));
     client().metadata_store().register_node("localhost:9199");
 
     bool repaired = false;
@@ -1117,6 +1124,227 @@ TEST_F(StorageClientTest, ReindexRecoversDegradedObjectAsRepairable) {
     EXPECT_NO_THROW(repaired = client().repair(object_id));
     EXPECT_TRUE(repaired);
     EXPECT_TRUE(client().health(object_id).healthy);
+}
+
+// ===========================================================================
+// Manual rebalancing toward HRW-intended placement. Reuses repair()'s
+// version-fenced commit; copies shards to their intended node and leaves old
+// copies as inert orphans for a future GC sweep.
+// ===========================================================================
+
+namespace {
+
+// Copies object shard `idx` onto `target_node` (a running, registered node) and
+// repoints the catalog to it, producing a present-but-misplaced shard so a
+// rebalance has real work to do. Returns the moved shard key.
+std::string ForceShardOntoNode(
+    StorageClient& client,
+    const std::string& object_id,
+    std::size_t idx,
+    const std::string& target_node
+) {
+    ObjectMetadata meta = *client.metadata_store().get(object_id);
+
+    const std::string& loc = meta.shard_locations.at(idx);
+    const auto pos = loc.find('/');
+    const std::string cur_node = loc.substr(0, pos);
+    const std::string key = loc.substr(pos + 1);
+
+    auto [cur_host, cur_port] = parse_address(cur_node);
+    httplib::Client src(cur_host, cur_port);
+    auto get_res = src.Get("/shards?location=" + key);
+    EXPECT_TRUE(get_res && get_res->status == 200);
+
+    auto [t_host, t_port] = parse_address(target_node);
+    httplib::Client dst(t_host, t_port);
+    auto put_res = dst.Put(
+        "/shards?location=" + key,
+        get_res->body,
+        "application/octet-stream"
+    );
+    EXPECT_TRUE(put_res && put_res->status == 200);
+
+    // Delete from source so the intended node is genuinely empty; the
+    // rebalancer's copy path is then actually exercised by the test.
+    auto del_res = src.Delete("/shards?location=" + key);
+    EXPECT_TRUE(del_res && del_res->status == 200);
+
+    meta.shard_locations[idx] = target_node + "/" + key;
+    EXPECT_TRUE(client.metadata_store().conditional_put(meta, meta.version));
+    return key;
+}
+
+std::string NodeOf(const std::string& shard_location) {
+    return shard_location.substr(0, shard_location.find('/'));
+}
+
+}  // namespace
+
+TEST_F(StorageClientTest, PutPlacesShardsOnHrwIntendedNodes) {
+    const std::string object_id = "00000000-0000-0000-0000-000000008001";
+    client().put(object_id, ToBytes("hrw placement check"), TestErasureSpec());
+
+    const auto items = client().list();
+    const ObjectMetadata* meta = FindObjectMetadata(items, object_id);
+    ASSERT_NE(meta, nullptr);
+    ASSERT_EQ(meta->shard_locations.size(), 3u);
+
+    const std::vector<std::string> nodes = client().metadata_store().list_nodes();
+    const std::vector<std::string> intended =
+        hrw_intended_nodes(object_id, nodes, 3);
+
+    for (std::size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(NodeOf(meta->shard_locations[i]), intended[i])
+            << "shard index " << i;
+    }
+}
+
+TEST_F(StorageClientTest, RebalanceObjectAlreadyBalancedIsNoop) {
+    const std::string object_id = "00000000-0000-0000-0000-000000008002";
+    client().put(object_id, ToBytes("already balanced"), TestErasureSpec());
+
+    const auto version_before =
+        client().metadata_store().get(object_id)->version;
+
+    RebalanceObjectResult r = client().rebalance_object(object_id);
+    EXPECT_EQ(r.status, RebalanceStatus::Balanced);
+    EXPECT_EQ(r.shards_misplaced, 0u);
+    EXPECT_EQ(r.shards_moved, 0u);
+
+    const auto version_after =
+        client().metadata_store().get(object_id)->version;
+    EXPECT_EQ(version_after, version_before);
+}
+
+TEST_F(StorageClientTest, RebalanceObjectMovesMisplacedShard) {
+    const std::string object_id = "00000000-0000-0000-0000-000000008003";
+    const std::string payload = "rebalance moves me back";
+    client().put(object_id, ToBytes(payload), TestErasureSpec());
+
+    ObjectMetadata before = *client().metadata_store().get(object_id);
+    const std::string intended0 = NodeOf(before.shard_locations[0]);
+    const std::string target = NodeOf(before.shard_locations[1]);
+    ASSERT_NE(intended0, target);
+
+    const std::string moved_key =
+        ForceShardOntoNode(client(), object_id, 0, target);
+
+    // Capture the state the rebalancer actually operates on.
+    ObjectMetadata displaced = *client().metadata_store().get(object_id);
+
+    RebalanceObjectResult r = client().rebalance_object(object_id);
+    EXPECT_EQ(r.status, RebalanceStatus::Moved);
+    EXPECT_EQ(r.shards_moved, 1u);
+
+    // Catalog points at the intended node again, and version was bumped by
+    // the rebalance commit (not by the force step).
+    ObjectMetadata after = *client().metadata_store().get(object_id);
+    EXPECT_EQ(NodeOf(after.shard_locations[0]), intended0);
+    EXPECT_GT(after.version, displaced.version);
+    EXPECT_EQ(ToString(client().get(object_id)), payload);
+
+    // Copy path actually ran: shard bytes are now present on the intended node.
+    {
+        auto [i_host, i_port] = parse_address(intended0);
+        httplib::Client intended_client(i_host, i_port);
+        auto res = intended_client.Get("/shards?location=" + moved_key);
+        ASSERT_TRUE(res);
+        EXPECT_EQ(res->status, 200)
+            << "rebalancer must physically copy shard to intended node";
+    }
+
+    // No inline delete: the old copy on `target` remains as an orphan
+    // (reclaimed by future GC per ADR / plan step 7d).
+    {
+        auto [t_host, t_port] = parse_address(target);
+        httplib::Client target_client(t_host, t_port);
+        auto res = target_client.Get("/shards?location=" + moved_key);
+        ASSERT_TRUE(res);
+        EXPECT_EQ(res->status, 200)
+            << "old shard bytes must remain on source (no inline delete)";
+    }
+}
+
+TEST_F(StorageClientTest, RebalanceObjectDryRunReportsWithoutMoving) {
+    const std::string object_id = "00000000-0000-0000-0000-000000008004";
+    client().put(object_id, ToBytes("dry run no move"), TestErasureSpec());
+
+    ObjectMetadata before = *client().metadata_store().get(object_id);
+    const std::string target = NodeOf(before.shard_locations[1]);
+    ForceShardOntoNode(client(), object_id, 0, target);
+
+    ObjectMetadata displaced = *client().metadata_store().get(object_id);
+
+    RebalancePolicy policy;
+    policy.dry_run = true;
+    RebalanceObjectResult r = client().rebalance_object(object_id, policy);
+    EXPECT_EQ(r.status, RebalanceStatus::DryRun);
+    EXPECT_GE(r.shards_misplaced, 1u);
+    EXPECT_EQ(r.shards_moved, 0u);
+
+    // Placement and version are untouched by a dry run.
+    ObjectMetadata after = *client().metadata_store().get(object_id);
+    EXPECT_EQ(after.shard_locations, displaced.shard_locations);
+    EXPECT_EQ(after.version, displaced.version);
+}
+
+TEST_F(StorageClientTest, RebalanceSkipsDegradedObject) {
+    const std::string object_id = "00000000-0000-0000-0000-000000008005";
+    client().put(object_id, ToBytes("degraded skip"), TestErasureSpec());
+
+    // Delete shard 0 so the object is degraded (a shard is unreachable).
+    ObjectMetadata meta = *client().metadata_store().get(object_id);
+    const std::string loc0 = meta.shard_locations[0];
+    const std::string key = loc0.substr(loc0.find('/') + 1);
+    auto [host, port] = parse_address(NodeOf(loc0));
+    httplib::Client node(host, port);
+    ASSERT_TRUE(node.Delete("/shards?location=" + key));
+
+    RebalanceObjectResult r = client().rebalance_object(object_id);
+    EXPECT_EQ(r.status, RebalanceStatus::SkippedDegraded);
+    EXPECT_EQ(r.shards_moved, 0u);
+
+    ObjectMetadata after = *client().metadata_store().get(object_id);
+    EXPECT_EQ(after.version, meta.version);
+}
+
+TEST_F(StorageClientTest, RebalanceObjectReportsNotFound) {
+    RebalanceObjectResult r =
+        client().rebalance_object("00000000-0000-0000-0000-0000000080ff");
+    EXPECT_EQ(r.status, RebalanceStatus::SkippedNotFound);
+    EXPECT_EQ(r.shards_moved, 0u);
+}
+
+TEST_F(StorageClientTest, RebalanceScopeHonorsMaxObjects) {
+    client().put("00000000-0000-0000-0000-000000008010", ToBytes("obj a"), TestErasureSpec());
+    client().put("00000000-0000-0000-0000-000000008011", ToBytes("obj b"), TestErasureSpec());
+    client().put("00000000-0000-0000-0000-000000008012", ToBytes("obj c"), TestErasureSpec());
+
+    RebalanceScope scope;
+    scope.max_objects = 2;
+    RebalanceReport report = client().rebalance(scope);
+    EXPECT_EQ(report.objects_scanned, 2u);
+}
+
+TEST_F(StorageClientTest, RebalanceScopeHonorsMaxMoves) {
+    const std::string id_a = "00000000-0000-0000-0000-000000008020";
+    const std::string id_b = "00000000-0000-0000-0000-000000008021";
+    client().put(id_a, ToBytes("budget a"), TestErasureSpec());
+    client().put(id_b, ToBytes("budget b"), TestErasureSpec());
+
+    for (const std::string& id : {id_a, id_b}) {
+        ObjectMetadata m = *client().metadata_store().get(id);
+        ForceShardOntoNode(client(), id, 0, NodeOf(m.shard_locations[1]));
+    }
+
+    RebalanceScope scope;
+    scope.object_ids = {id_a, id_b};
+    scope.max_moves = 1;
+    RebalanceReport report = client().rebalance(scope);
+
+    // The budget stops the pass after a single shard move.
+    EXPECT_EQ(report.shards_moved, 1u);
+    EXPECT_EQ(report.objects_moved, 1u);
 }
 
 }  // namespace

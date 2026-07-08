@@ -32,6 +32,9 @@ Servers expose the following routes:
 | `GET` | `/objects` | List all objects |
 | `GET` | `/objects/:id/health` | Inspect shard availability |
 | `POST` | `/objects/:id/repair` | Repair degraded object |
+| `POST` | `/objects/:id/rebalance` | Move one object toward its HRW-intended placement ([ADR-0009](0009-rebalancing.md)) |
+| `POST` | `/admin/reindex` | Rebuild the metadata catalog from self-describing shards ([ADR-0008](0008-self-describing-shards.md)) |
+| `POST` | `/admin/rebalance` | Rebalance a bounded set of objects toward HRW placement ([ADR-0009](0009-rebalancing.md)) |
 
 **StorageNodeServer** (internal shard storage):
 | Method | Path | Description |

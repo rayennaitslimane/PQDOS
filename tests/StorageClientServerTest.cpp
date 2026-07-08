@@ -384,4 +384,136 @@ TEST_F(StorageClientServerTest, RepairReturns500ForMissingObject) {
     EXPECT_TRUE(body.contains("error"));
 }
 
+// ===========================================================================
+// Rebalance endpoint tests
+// ===========================================================================
+
+TEST_F(StorageClientServerTest, RebalanceObjectReturnsOkForBalancedObject) {
+    const std::string id = "00000000-0000-0000-0000-000000000401";
+    const std::string data = "rebalance-route-test";
+
+    nlohmann::json payload;
+    payload["data"] = Botan::base64_encode(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    payload["k"] = 2;
+    payload["m"] = 1;
+    payload["shard_size"] = 20;
+
+    auto put_res = client_.Put("/objects/" + id, payload.dump(), "application/json");
+    ASSERT_TRUE(put_res);
+    ASSERT_EQ(put_res->status, 200);
+
+    // A freshly written object is already on its HRW-intended placement.
+    auto res = client_.Post("/objects/" + id + "/rebalance", "", "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    EXPECT_EQ(body["status"], "ok");
+    EXPECT_EQ(body["object_id"], id);
+    EXPECT_EQ(body["outcome"], "balanced");
+    EXPECT_EQ(body["shards_total"].get<unsigned>(), 3u);
+    EXPECT_EQ(body["shards_moved"].get<unsigned>(), 0u);
+
+    cleanup(id);
+}
+
+TEST_F(StorageClientServerTest, RebalanceObjectAcceptsDryRunBody) {
+    const std::string id = "00000000-0000-0000-0000-000000000402";
+    const std::string data = "rebalance-dry-run";
+
+    nlohmann::json payload;
+    payload["data"] = Botan::base64_encode(
+        reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    payload["k"] = 2;
+    payload["m"] = 1;
+    payload["shard_size"] = 20;
+    ASSERT_TRUE(client_.Put("/objects/" + id, payload.dump(), "application/json"));
+
+    nlohmann::json body;
+    body["dry_run"] = true;
+    auto res = client_.Post("/objects/" + id + "/rebalance", body.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+
+    auto parsed = nlohmann::json::parse(res->body);
+    EXPECT_EQ(parsed["status"], "ok");
+    EXPECT_EQ(parsed["shards_moved"].get<unsigned>(), 0u);
+
+    cleanup(id);
+}
+
+TEST_F(StorageClientServerTest, RebalanceObjectRejectsInvalidJsonBody) {
+    auto res = client_.Post(
+        "/objects/00000000-0000-0000-0000-000000000403/rebalance",
+        "{ not json", "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400);
+    auto body = nlohmann::json::parse(res->body);
+    EXPECT_TRUE(body.contains("error"));
+}
+
+TEST_F(StorageClientServerTest, RebalanceObjectRejectsBadDryRunType) {
+    nlohmann::json body;
+    body["dry_run"] = "yes";  // must be a boolean
+    auto res = client_.Post(
+        "/objects/00000000-0000-0000-0000-000000000404/rebalance",
+        body.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400);
+    EXPECT_TRUE(nlohmann::json::parse(res->body).contains("error"));
+}
+
+TEST_F(StorageClientServerTest, AdminRebalanceReturnsReport) {
+    const std::string id1 = "00000000-0000-0000-0000-000000000410";
+    const std::string id2 = "00000000-0000-0000-0000-000000000411";
+
+    for (const std::string& id : {id1, id2}) {
+        nlohmann::json payload;
+        payload["data"] = Botan::base64_encode(
+            reinterpret_cast<const uint8_t*>(id.data()), id.size());
+        payload["k"] = 2;
+        payload["m"] = 1;
+        payload["shard_size"] = 40;
+        ASSERT_TRUE(client_.Put("/objects/" + id, payload.dump(), "application/json"));
+    }
+
+    nlohmann::json req_body;
+    req_body["object_ids"] = {id1, id2};
+    auto res = client_.Post("/admin/rebalance", req_body.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    EXPECT_EQ(body["status"], "ok");
+    EXPECT_EQ(body["objects_scanned"].get<unsigned>(), 2u);
+    EXPECT_EQ(body["objects_balanced"].get<unsigned>(), 2u);
+    EXPECT_EQ(body["shards_moved"].get<unsigned>(), 0u);
+    ASSERT_TRUE(body["results"].is_array());
+    EXPECT_EQ(body["results"].size(), 2u);
+
+    cleanup(id1);
+    cleanup(id2);
+}
+
+TEST_F(StorageClientServerTest, AdminRebalanceAcceptsDryRun) {
+    nlohmann::json req_body;
+    req_body["dry_run"] = true;
+    req_body["object_ids"] = nlohmann::json::array();  // nothing to process
+    auto res = client_.Post("/admin/rebalance", req_body.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    EXPECT_EQ(body["status"], "ok");
+    EXPECT_TRUE(body["dry_run"].get<bool>());
+}
+
+TEST_F(StorageClientServerTest, AdminRebalanceRejectsInvalidJsonBody) {
+    auto res = client_.Post("/admin/rebalance", "{ bad", "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400);
+    EXPECT_TRUE(nlohmann::json::parse(res->body).contains("error"));
+}
+
 } // namespace

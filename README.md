@@ -35,11 +35,12 @@ Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
 | [0001](docs/adr/0001-quantum-encryption.md) | ML-KEM-768 KEM-based KEK ring + AES-256-GCM per-object DEK with shard-index AAD |
 | [0002](docs/adr/0002-erasure-codec.md) | ISA-L Reed-Solomon erasure coding with per-object `k`/`m`/`shard_size` |
 | [0003](docs/adr/0003-dual-storage.md) | LMDB for shard payloads, PostgreSQL for object metadata |
-| [0004](docs/adr/0004-shard-transport.md) | Parallel HTTP shard dispatch with dynamic placement and thread-local per-node client reuse |
+| [0004](docs/adr/0004-shard-transport.md) | Parallel HTTP shard dispatch, HRW (rendezvous) placement over a dynamic node registry, thread-local per-node client reuse |
 | [0005](docs/adr/0005-http-surface.md) | cpp-httplib embedded HTTP server with Base64 object payloads and JSON erasure parameters |
 | [0006](docs/adr/0006-concurrency-contract.md) | Concurrency contract: MetadataStore mutex, KEK ring shared_mutex, tolerated per-object races |
 | [0007](docs/adr/0007-metrics-collector.md) | Inline metrics instrumentation with ScopedTimer, CSV export, benchmark harness |
 | [0008](docs/adr/0008-self-describing-shards.md) | Self-describing shards (per-object manifest replicated onto every shard) with a metadata rebuild path |
+| [0009](docs/adr/0009-rebalancing.md) | HRW rendezvous placement and manual, version-fenced rebalancing toward intended placement |
 
 
 ## II. Prerequisites
@@ -162,7 +163,50 @@ curl -X POST http://localhost:8080/objects/00000000-0000-0000-0000-000000000001/
 # {"status":"ok","repaired":true}
 ```
 
-Reconstructs missing shards from surviving ones using erasure coding, re-encrypts them with the original DEK (fresh nonces), and places them on eligible nodes. Uses optimistic version fencing and returns `"repaired": false` if a concurrent mutation occurred during repair.
+Reconstructs missing shards from surviving ones using erasure coding, re-encrypts them with the original DEK (fresh nonces), and places them on their HRW-intended node when healthy (falling back to any healthy node otherwise). Uses optimistic version fencing and returns `"repaired": false` if a concurrent mutation occurred during repair.
+
+### Rebalance an object toward its intended placement
+
+```bash
+curl -X POST http://localhost:8080/objects/00000000-0000-0000-0000-000000000001/rebalance \
+  -H "Content-Type: application/json" \
+  -d '{"dry_run":false}'
+# {
+#   "status": "ok",
+#   "object_id": "00000000-0000-0000-0000-000000000001",
+#   "outcome": "balanced",
+#   "shards_total": 3,
+#   "shards_misplaced": 0,
+#   "shards_moved": 0,
+#   "detail": "already on intended placement"
+# }
+```
+
+Moves an object's shards toward their HRW (rendezvous) intended placement ([ADR-0009](docs/adr/0009-rebalancing.md)). Each moved shard is copied to its intended node **before** a version-fenced metadata commit (the same fence `repair()` uses), so durability is never reduced; old copies are left as inert orphans for a future GC sweep. Degraded objects are skipped (repair heals them first). Optional body fields: `dry_run` (plan only, write nothing) and `max_moves` (cap on shards relocated).
+
+### Rebalance a bounded set of objects
+
+```bash
+curl -X POST http://localhost:8080/admin/rebalance \
+  -H "Content-Type: application/json" \
+  -d '{"dry_run":true,"max_objects":100,"max_moves":500}'
+# {
+#   "status": "ok",
+#   "dry_run": true,
+#   "objects_scanned": 100,
+#   "objects_balanced": 100,
+#   "objects_moved": 0,
+#   "objects_skipped_degraded": 0,
+#   "objects_skipped_unsafe": 0,
+#   "objects_skipped_conflict": 0,
+#   "objects_not_found": 0,
+#   "objects_errored": 0,
+#   "shards_moved": 0,
+#   "results": []
+# }
+```
+
+Runs the per-object rebalance across a bounded scope. Optional body fields: `object_ids` (explicit set; empty = whole catalog), `max_objects`, `max_moves`, and `dry_run`. Intended as an administrative operation; bound large clusters with `max_objects`/`max_moves`.
 
 ### Rebuild the metadata catalog
 
@@ -196,11 +240,11 @@ Used internally by the client. Each node exposes:
 
 ## VII. Rough Backlog
 
-* ~~Improve the placement strategy by selecting nodes from those available.~~ &nbsp;&nbsp; Implemented via dynamic node registry.
+* ~~Improve the placement strategy by selecting nodes from those available.~~ &nbsp;&nbsp; Implemented via dynamic node registry, then HRW rendezvous placement ([ADR-0009](docs/adr/0009-rebalancing.md)).
 * ~~Add a repair strategy that operates on a single route.~~ &nbsp;&nbsp; Implemented via `/objects/:id/repair`.
 * ~~Implement metrics collection to begin benchmarking.~~ &nbsp;&nbsp; Implemented via `MetricsCollector` + `benchmark` executable.
 * Introduce a chunking strategy to manage data or workload more effectively.
-* Implement a garbage collection strategy to clean up unused resources.
+* Implement a garbage collection strategy to clean up unused resources (including shards orphaned by `repair`/`rebalance` and lost write races).
 
 ## VIII. Benchmarking
 

@@ -6,6 +6,35 @@
 #include <string>
 #include <vector>
 
+namespace {
+
+const char* rebalance_status_str(RebalanceStatus status) {
+    switch (status) {
+        case RebalanceStatus::Balanced:        return "balanced";
+        case RebalanceStatus::Moved:           return "moved";
+        case RebalanceStatus::DryRun:          return "dry_run";
+        case RebalanceStatus::SkippedDegraded: return "skipped_degraded";
+        case RebalanceStatus::SkippedUnsafe:   return "skipped_unsafe";
+        case RebalanceStatus::SkippedConflict: return "skipped_conflict";
+        case RebalanceStatus::SkippedNotFound: return "not_found";
+        case RebalanceStatus::Errored:         return "error";
+    }
+    return "unknown";
+}
+
+nlohmann::json rebalance_result_json(const RebalanceObjectResult& result) {
+    nlohmann::json item;
+    item["object_id"] = result.object_id;
+    item["outcome"] = rebalance_status_str(result.status);
+    item["shards_total"] = result.shards_total;
+    item["shards_misplaced"] = result.shards_misplaced;
+    item["shards_moved"] = result.shards_moved;
+    item["detail"] = result.detail;
+    return item;
+}
+
+}  // namespace
+
 StorageClientServer::StorageClientServer(
     StorageClient& client,
     const std::string& host,
@@ -269,6 +298,168 @@ void StorageClientServer::setup_routes() {
         body["degraded_objects"] = report.degraded_objects;
         body["unreadable_versions"] = report.unreadable_versions;
         body["errors"] = report.errors;
+        res.set_content(body.dump(), "application/json");
+    });
+
+    server_.Post("/objects/:id/rebalance", [this](const httplib::Request& req, httplib::Response& res) {
+        const std::string id = req.path_params.at("id");
+
+        if (id.empty()) {
+            nlohmann::json body;
+            body["error"] = "id must not be empty";
+            res.status = 400;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        // Body is optional; an empty body means default policy.
+        nlohmann::json input = nlohmann::json::object();
+        if (!req.body.empty()) {
+            try {
+                input = nlohmann::json::parse(req.body);
+            } catch (const std::exception&) {
+                nlohmann::json body;
+                body["error"] = "invalid JSON body";
+                res.status = 400;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
+        }
+
+        RebalancePolicy policy;
+        if (input.contains("dry_run")) {
+            if (!input["dry_run"].is_boolean()) {
+                nlohmann::json body;
+                body["error"] = "'dry_run' must be a boolean";
+                res.status = 400;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
+            policy.dry_run = input["dry_run"].get<bool>();
+        }
+        if (input.contains("max_moves")) {
+            if (!input["max_moves"].is_number_unsigned()) {
+                nlohmann::json body;
+                body["error"] = "'max_moves' must be a non-negative integer";
+                res.status = 400;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
+            policy.max_moves = input["max_moves"].get<std::size_t>();
+        }
+
+        RebalanceObjectResult result;
+        try {
+            result = client_.rebalance_object(id, policy);
+        } catch (const std::exception& e) {
+            nlohmann::json body;
+            body["error"] = e.what();
+            res.status = 500;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        nlohmann::json body = rebalance_result_json(result);
+        body["status"] = "ok";
+        res.set_content(body.dump(), "application/json");
+    });
+
+    server_.Post("/admin/rebalance", [this](const httplib::Request& req, httplib::Response& res) {
+        // Body is optional; an empty body means "rebalance the whole catalog".
+        nlohmann::json input = nlohmann::json::object();
+        if (!req.body.empty()) {
+            try {
+                input = nlohmann::json::parse(req.body);
+            } catch (const std::exception&) {
+                nlohmann::json body;
+                body["error"] = "invalid JSON body";
+                res.status = 400;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
+        }
+
+        RebalanceScope scope;
+        if (input.contains("dry_run")) {
+            if (!input["dry_run"].is_boolean()) {
+                nlohmann::json body;
+                body["error"] = "'dry_run' must be a boolean";
+                res.status = 400;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
+            scope.dry_run = input["dry_run"].get<bool>();
+        }
+        if (input.contains("max_objects")) {
+            if (!input["max_objects"].is_number_unsigned()) {
+                nlohmann::json body;
+                body["error"] = "'max_objects' must be a non-negative integer";
+                res.status = 400;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
+            scope.max_objects = input["max_objects"].get<std::size_t>();
+        }
+        if (input.contains("max_moves")) {
+            if (!input["max_moves"].is_number_unsigned()) {
+                nlohmann::json body;
+                body["error"] = "'max_moves' must be a non-negative integer";
+                res.status = 400;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
+            scope.max_moves = input["max_moves"].get<std::size_t>();
+        }
+        if (input.contains("object_ids")) {
+            if (!input["object_ids"].is_array()) {
+                nlohmann::json body;
+                body["error"] = "'object_ids' must be an array of strings";
+                res.status = 400;
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
+            for (const auto& entry : input["object_ids"]) {
+                if (!entry.is_string()) {
+                    nlohmann::json body;
+                    body["error"] = "'object_ids' must be an array of strings";
+                    res.status = 400;
+                    res.set_content(body.dump(), "application/json");
+                    return;
+                }
+                scope.object_ids.push_back(entry.get<std::string>());
+            }
+        }
+
+        RebalanceReport report;
+        try {
+            report = client_.rebalance(scope);
+        } catch (const std::exception& e) {
+            nlohmann::json body;
+            body["error"] = e.what();
+            res.status = 500;
+            res.set_content(body.dump(), "application/json");
+            return;
+        }
+
+        nlohmann::json body;
+        body["status"] = "ok";
+        body["dry_run"] = report.dry_run;
+        body["objects_scanned"] = report.objects_scanned;
+        body["objects_balanced"] = report.objects_balanced;
+        body["objects_moved"] = report.objects_moved;
+        body["objects_skipped_degraded"] = report.objects_skipped_degraded;
+        body["objects_skipped_unsafe"] = report.objects_skipped_unsafe;
+        body["objects_skipped_conflict"] = report.objects_skipped_conflict;
+        body["objects_not_found"] = report.objects_not_found;
+        body["objects_errored"] = report.objects_errored;
+        body["shards_moved"] = report.shards_moved;
+
+        nlohmann::json results = nlohmann::json::array();
+        for (const auto& r : report.results) {
+            results.push_back(rebalance_result_json(r));
+        }
+        body["results"] = std::move(results);
+
         res.set_content(body.dump(), "application/json");
     });
 }

@@ -72,3 +72,29 @@ std::optional<ShardManifest> fetch_shard_manifest(
 void remove_from_nodes(const ShardLocationMap& shard_location_map);
 
 bool probe_shard(const std::string& node_address, const std::string& location);
+
+// Fetch the raw stored payload for a single shard via GET /shards. Returns the
+// bytes verbatim (a self-describing StoredShard envelope, ADR-0008) so a caller
+// can copy a shard to another node without decoding/re-encrypting it. Returns
+// nullopt on transport failure or a non-200 response.
+std::optional<Bytes> fetch_raw_shard(
+    const std::string& node_address,
+    const std::string& location
+);
+
+// Compute the HRW (Highest Random Weight / rendezvous) intended placement for an
+// object's shards. Returns a vector of size total_shards where element i is the
+// intended node address for shard index i. Nodes are distinct across shards.
+//
+// Each shard independently ranks nodes by a rendezvous weight derived from
+// (object_id, shard_index, node_address) and greedily takes the highest-weighted
+// node not already assigned to a lower shard index. This yields a deterministic,
+// membership-stable placement: adding or removing a node only reshuffles the
+// shards for which that node would win, minimising data movement.
+//
+// Throws if eligible_nodes.size() < total_shards.
+std::vector<std::string> hrw_intended_nodes(
+    const std::string& object_id,
+    const std::vector<std::string>& eligible_nodes,
+    std::size_t total_shards
+);

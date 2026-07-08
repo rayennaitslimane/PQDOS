@@ -101,6 +101,7 @@ The following invariants hold under the implementation described above:
 | Concurrent `repair(X)` / `repair(X)` | Exactly one succeeds; the other detects version mismatch and returns false | No UB; optimistic version fencing ensures only one commit wins; the losing repair's shards become orphans |
 | Concurrent `repair(X)` / `put(X)` | `repair()` aborts if `put()` commits first (version changed); if `repair()` commits first, `put()` overwrites with a new version | No UB; `repair()` uses conditional_put which checks version; `put()` uses unconditional upsert that increments version |
 | Concurrent `repair(X)` / `remove(X)` | `repair()` aborts if metadata is deleted before commit; repaired shards become orphans | No UB; conditional_put fails gracefully; repaired shards are inert encrypted data |
+| Concurrent `rebalance(X)` / `put(X)` / `remove(X)` / `repair(X)` / `rebalance(X)` | `rebalance()` aborts if the other mutation commits first (version changed); the shards it copied to their target become orphans | No UB; `rebalance()` uses `conditional_put` version fencing and writes the target copies *before* committing, so a lost race never reduces durability and never overwrites the winner's metadata |
 
 ### 5. Repair: optimistic metadata version fencing
 
@@ -114,6 +115,29 @@ The following invariants hold under the implementation described above:
 Repair target liveness filtering is orthogonal to version fencing: `repair()` first filters registered nodes by `/health` and only writes replacements to healthy targets. A repair returns `false` only for version-mismatch conflicts; transport/liveness insufficiency remains an exception path.
 
 This ensures that repair never silently overwrites a concurrent mutation's metadata.
+
+### 6. Rebalance: reuses repair's version fence
+
+`StorageClient::rebalance_object()` ([ADR-0009](0009-rebalancing.md)) is another
+conflicting mutation on an object, and it is resolved by the **same** optimistic
+fence as repair:
+
+1. It records the object's `version` at the start.
+2. It copies each shard being moved to its HRW-intended node **before** the
+   metadata commit (the self-describing shard is copied verbatim, ADR-0008), so
+   at no point is the object's committed replication reduced.
+3. It commits with `conditional_put(metadata, expected_version)`. If any
+   concurrent `put`/`remove`/`repair`/`rebalance` advanced the version, the
+   commit affects zero rows and the object is reported `SkippedConflict`; the
+   copies it wrote become inert orphans.
+4. It only ever *adds* shard copies and repoints metadata - it issues **no
+   deletes**. Old copies on the previous nodes are left as inert orphans for a
+   future GC sweep. A failed or lost rebalance can therefore only leak storage,
+   never lose data or corrupt another mutation's metadata.
+
+Rebalance additionally refuses to act on a degraded object (any shard missing or
+unreachable), so it never races repair for the healing of an under-replicated
+object.
 
 ## Consequences
 

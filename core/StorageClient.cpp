@@ -9,6 +9,7 @@
 #include <botan/pk_algs.h>
 #include <httplib.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -334,7 +335,13 @@ void StorageClient::put(const std::string& object_id, const Bytes& bytes, const 
     }
 
     // 5) placement_strategy(serialized_shards)
-    PlacementMap placement = placement_strategy(object_id, version, serialized_shards, eligible_nodes);
+    // Shards are placed on their HRW (rendezvous) intended nodes so placement is
+    // deterministic and membership-stable; placement_strategy assigns shard i to
+    // intended_nodes[i].
+    const std::vector<std::string> intended_nodes =
+        hrw_intended_nodes(object_id, eligible_nodes, serialized_shards.size());
+
+    PlacementMap placement = placement_strategy(object_id, version, serialized_shards, intended_nodes);
 
     // 6) apply_placement(map) over HTTP
     {
@@ -741,16 +748,30 @@ bool StorageClient::repair(const std::string& object_id) {
         // 10) Place repaired shards on eligible nodes
         const std::vector<std::string> eligible_nodes = metadata_store_.list_nodes();
         std::vector<std::string> healthy_nodes;
+        std::unordered_set<std::string> healthy_set;
         healthy_nodes.reserve(eligible_nodes.size());
 
         for (const auto& node : eligible_nodes) {
             if (is_node_healthy(node)) {
                 healthy_nodes.push_back(node);
+                healthy_set.insert(node);
             }
         }
 
+        const std::size_t total_shards =
+            static_cast<std::size_t>(metadata.erasure.data_shards) +
+            metadata.erasure.parity_shards;
+
+        // HRW-intended placement over all registered nodes (deterministic and
+        // membership-stable). Repaired shards prefer their intended node so
+        // repair heals toward the same layout put() and rebalance() target.
+        // Only computable when at least k+m nodes are registered.
+        std::vector<std::string> intended;
+        if (eligible_nodes.size() >= total_shards) {
+            intended = hrw_intended_nodes(object_id, eligible_nodes, total_shards);
+        }
+
         // Build set of nodes already used by surviving shards
-        std::vector<std::string> available_for_repair;
         std::unordered_set<std::string> used_nodes;
         for (uint32_t idx : surviving_indices) {
             const auto& shard_location = metadata.shard_locations[idx];
@@ -760,28 +781,59 @@ bool StorageClient::repair(const std::string& object_id) {
             }
         }
 
+        // Fallback candidate pool: healthy nodes not holding a surviving shard
+        // first, then healthy nodes that do (last resort, may co-locate two
+        // shards of the same object) so repair never fails when enough healthy
+        // nodes exist - preserving prior repair behaviour.
+        std::vector<std::string> fallback_pool;
         for (const auto& node : healthy_nodes) {
-            if (used_nodes.find(node) == used_nodes.end()) {
-                available_for_repair.push_back(node);
+            if (used_nodes.count(node) == 0) {
+                fallback_pool.push_back(node);
+            }
+        }
+        for (const auto& node : healthy_nodes) {
+            if (used_nodes.count(node) > 0) {
+                fallback_pool.push_back(node);
             }
         }
 
-        // If not enough unused nodes, allow reuse of existing nodes
-        if (available_for_repair.size() < missing_indices.size()) {
-            for (const auto& node : healthy_nodes) {
-                if (used_nodes.count(node) > 0) {
-                    available_for_repair.push_back(node);
-                }
-                if (available_for_repair.size() >= missing_indices.size()) {
-                    break;
+        // Assign one distinct target per missing shard: prefer the HRW-intended
+        // node when it is healthy and still free, otherwise draw from the pool.
+        std::vector<std::string> available_for_repair;
+        available_for_repair.reserve(missing_indices.size());
+        std::unordered_set<std::string> consumed;
+        std::size_t pool_cursor = 0;
+
+        for (std::size_t i = 0; i < missing_indices.size(); ++i) {
+            const uint32_t idx = missing_indices[i];
+            std::string target;
+
+            if (!intended.empty()) {
+                const std::string& want = intended[idx];
+                if (healthy_set.count(want) > 0 && consumed.count(want) == 0) {
+                    target = want;
                 }
             }
-        }
 
-        if (available_for_repair.size() < missing_indices.size()) {
-            throw std::runtime_error(
-                "StorageClient::repair: not enough healthy eligible nodes for repaired shards"
-            );
+            if (target.empty()) {
+                while (pool_cursor < fallback_pool.size() &&
+                       consumed.count(fallback_pool[pool_cursor]) > 0) {
+                    ++pool_cursor;
+                }
+                if (pool_cursor < fallback_pool.size()) {
+                    target = fallback_pool[pool_cursor];
+                    ++pool_cursor;
+                }
+            }
+
+            if (target.empty()) {
+                throw std::runtime_error(
+                    "StorageClient::repair: not enough healthy eligible nodes for repaired shards"
+                );
+            }
+
+            consumed.insert(target);
+            available_for_repair.push_back(target);
         }
 
         // Extract version from existing shard keys.
@@ -1063,6 +1115,270 @@ ReindexReport StorageClient::reindex() {
         if (candidate.shard_count < total) {
             ++report.degraded_objects;
         }
+    }
+
+    return report;
+}
+
+RebalanceObjectResult StorageClient::rebalance_object(
+    const std::string& object_id,
+    const RebalancePolicy& policy
+) {
+    if (object_id.empty()) {
+        throw std::invalid_argument(
+            "StorageClient::rebalance_object: object_id cannot be empty");
+    }
+
+    RebalanceObjectResult result;
+    result.object_id = object_id;
+
+    // 1) Load metadata and record the fencing version (same fence as repair()).
+    const auto metadata_opt = metadata_store_.get(object_id);
+    if (!metadata_opt.has_value()) {
+        result.status = RebalanceStatus::SkippedNotFound;
+        result.detail = "object not found";
+        return result;
+    }
+
+    const ObjectMetadata& metadata = *metadata_opt;
+    const int expected_version = metadata.version;
+
+    const std::size_t total_shards =
+        static_cast<std::size_t>(metadata.erasure.data_shards) +
+        metadata.erasure.parity_shards;
+    result.shards_total = total_shards;
+
+    // 2) Safety: need a full, distinct placement of healthy nodes to move onto.
+    const std::vector<std::string> eligible_nodes = metadata_store_.list_nodes();
+    if (eligible_nodes.size() < total_shards) {
+        result.status = RebalanceStatus::SkippedUnsafe;
+        result.detail = "fewer than k+m registered nodes";
+        return result;
+    }
+
+    std::unordered_set<std::string> healthy_set;
+    for (const auto& node : eligible_nodes) {
+        if (is_node_healthy(node)) {
+            healthy_set.insert(node);
+        }
+    }
+    if (healthy_set.size() < total_shards) {
+        result.status = RebalanceStatus::SkippedUnsafe;
+        result.detail = "fewer than k+m healthy nodes";
+        return result;
+    }
+
+    // The metadata must describe a full positional placement (one entry per
+    // shard index) for per-index move reasoning.
+    if (metadata.shard_locations.size() != total_shards) {
+        result.status = RebalanceStatus::SkippedDegraded;
+        result.detail = "shard location count does not match k+m";
+        return result;
+    }
+
+    // 3) HRW-intended placement over all registered nodes (deterministic,
+    //    membership-stable). Matches the layout put() and repair() target.
+    const std::vector<std::string> intended =
+        hrw_intended_nodes(object_id, eligible_nodes, total_shards);
+
+    // 4) Degraded check + parse current placement. Rebalancing a degraded object
+    //    is unsafe (a move could drop live copies below k). Repair heals first.
+    std::vector<std::string> current_nodes(total_shards);
+    std::vector<std::string> current_keys(total_shards);
+    for (std::size_t i = 0; i < total_shards; ++i) {
+        const std::string& loc = metadata.shard_locations[i];
+        const auto pos = loc.find('/');
+        if (pos == std::string::npos) {
+            result.status = RebalanceStatus::SkippedDegraded;
+            result.detail = "malformed shard location";
+            return result;
+        }
+
+        current_nodes[i] = loc.substr(0, pos);
+        current_keys[i] = loc.substr(pos + 1);
+
+        if (!probe_shard(current_nodes[i], current_keys[i])) {
+            result.status = RebalanceStatus::SkippedDegraded;
+            result.detail = "shard missing or unreachable; repair first";
+            return result;
+        }
+    }
+
+    // 5) Plan moves: a shard moves only if its intended node differs from its
+    //    current node and that intended node is healthy.
+    struct PlannedMove {
+        std::size_t index = 0;
+        std::string from;
+        std::string to;
+        std::string key;
+    };
+    std::vector<PlannedMove> planned;
+
+    for (std::size_t i = 0; i < total_shards; ++i) {
+        if (current_nodes[i] == intended[i]) {
+            continue;
+        }
+        ++result.shards_misplaced;
+
+        // Intended target down: leave the shard for a later pass rather than
+        // moving it onto an unhealthy node.
+        if (healthy_set.count(intended[i]) == 0) {
+            continue;
+        }
+        planned.push_back({i, current_nodes[i], intended[i], current_keys[i]});
+    }
+
+    // Bound the number of moves for this object.
+    if (policy.max_moves > 0 && planned.size() > policy.max_moves) {
+        planned.resize(policy.max_moves);
+    }
+
+    if (result.shards_misplaced == 0) {
+        result.status = RebalanceStatus::Balanced;
+        result.detail = "already on intended placement";
+        return result;
+    }
+
+    if (planned.empty()) {
+        // Misplaced shards exist but none can move now (intended targets down or
+        // the move budget is zero).
+        result.status = RebalanceStatus::Balanced;
+        result.detail = "misplaced shards present but no eligible move now";
+        return result;
+    }
+
+    if (policy.dry_run) {
+        result.status = RebalanceStatus::DryRun;
+        result.detail =
+            std::to_string(planned.size()) + " shard(s) would move";
+        return result;
+    }
+
+    // 6) Copy each shard to its intended node BEFORE the metadata commit so
+    //    durability is never reduced. The shard key is identical on source and
+    //    target, so the self-describing manifest is preserved verbatim (ADR-0008).
+    PlacementMap move_placement;
+    std::vector<PlannedMove> fetched_moves;
+    for (const auto& mv : planned) {
+        std::optional<Bytes> payload = fetch_raw_shard(mv.from, mv.key);
+        if (!payload.has_value()) {
+            continue;  // could not read source; skip this shard, keep going
+        }
+        move_placement[mv.to].push_back({mv.key, std::move(*payload)});
+        fetched_moves.push_back(mv);
+    }
+
+    if (fetched_moves.empty()) {
+        result.status = RebalanceStatus::SkippedDegraded;
+        result.detail = "failed to read source shards";
+        return result;
+    }
+
+    // Write the new copies to the intended nodes (may throw on PUT failure;
+    // callers map that to an error). Partial writes are inert orphans.
+    apply_placement(move_placement);
+
+    // 7) Build updated shard_locations for only the shards we relocated.
+    std::vector<std::string> updated_locations = metadata.shard_locations;
+    for (const auto& mv : fetched_moves) {
+        updated_locations[mv.index] = mv.to + "/" + mv.key;
+    }
+
+    // 8) Version-fenced commit - the exact mechanism repair() relies on. If a
+    //    concurrent put/remove/repair changed the version, the conditional_put
+    //    affects zero rows and no metadata changes.
+    ObjectMetadata updated = metadata;
+    updated.shard_locations = updated_locations;
+
+    const bool committed =
+        metadata_store_.conditional_put(updated, expected_version);
+    if (!committed) {
+        // Concurrent mutation won the race. The freshly-written copies are inert
+        // orphans reclaimed by a future GC sweep; no metadata changed.
+        result.status = RebalanceStatus::SkippedConflict;
+        result.detail = "metadata version changed concurrently";
+        return result;
+    }
+
+    // Old copies on their previous nodes are intentionally left as inert orphans
+    // (reclaimed by a future GC sweep); they are not deleted inline.
+    result.status = RebalanceStatus::Moved;
+    result.shards_moved = fetched_moves.size();
+    result.detail = "relocated " + std::to_string(fetched_moves.size()) + " shard(s)";
+    return result;
+}
+
+RebalanceReport StorageClient::rebalance(const RebalanceScope& scope) {
+    RebalanceReport report;
+    report.dry_run = scope.dry_run;
+
+    // Resolve the object set: the named ids, or the whole catalog when none given.
+    std::vector<std::string> object_ids = scope.object_ids;
+    if (object_ids.empty()) {
+        for (const auto& meta : metadata_store_.list()) {
+            object_ids.push_back(meta.id);
+        }
+    }
+
+    const bool bounded_moves = scope.max_moves > 0;
+    std::size_t remaining_moves = scope.max_moves;  // meaningful only if bounded
+
+    for (const auto& object_id : object_ids) {
+        if (scope.max_objects > 0 && report.objects_scanned >= scope.max_objects) {
+            break;
+        }
+        if (bounded_moves && remaining_moves == 0) {
+            break;
+        }
+
+        ++report.objects_scanned;
+
+        RebalancePolicy policy;
+        policy.dry_run = scope.dry_run;
+        policy.max_moves = bounded_moves ? remaining_moves : 0;
+
+        RebalanceObjectResult r;
+        try {
+            r = rebalance_object(object_id, policy);
+        } catch (const std::exception& e) {
+            ++report.objects_errored;
+            RebalanceObjectResult err;
+            err.object_id = object_id;
+            err.status = RebalanceStatus::Errored;
+            err.detail = std::string("error: ") + e.what();
+            report.results.push_back(std::move(err));
+            continue;
+        }
+
+        switch (r.status) {
+            case RebalanceStatus::Balanced:
+                ++report.objects_balanced;
+                break;
+            case RebalanceStatus::Moved:
+                ++report.objects_moved;
+                report.shards_moved += r.shards_moved;
+                if (bounded_moves) {
+                    remaining_moves -= std::min(remaining_moves, r.shards_moved);
+                }
+                break;
+            case RebalanceStatus::SkippedDegraded:
+                ++report.objects_skipped_degraded;
+                break;
+            case RebalanceStatus::SkippedUnsafe:
+                ++report.objects_skipped_unsafe;
+                break;
+            case RebalanceStatus::SkippedConflict:
+                ++report.objects_skipped_conflict;
+                break;
+            case RebalanceStatus::SkippedNotFound:
+                ++report.objects_not_found;
+                break;
+            case RebalanceStatus::DryRun:
+            case RebalanceStatus::Errored:
+                break;  // DryRun carried in results; Errored counted above
+        }
+
+        report.results.push_back(std::move(r));
     }
 
     return report;

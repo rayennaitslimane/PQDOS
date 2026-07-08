@@ -2,7 +2,7 @@
 
 **Status:** Accepted (amended)  
 **Date:** 2026-06-11  
-**Amended:** 2026-06-22
+**Amended:** 2026-06-22, 2026-07-08
 
 ## Context
 
@@ -20,7 +20,7 @@ The primary alternatives considered were synchronous sequential HTTP calls, asyn
 
 ~~The original placement algorithm assigned shard `i` to a static `kNodeAddresses[i]` array parsed from the `NODE_ADDRESSES` environment variable at process start.~~
 
-**Current implementation:** Node addresses are stored in a PostgreSQL `nodes` table managed by `MetadataStore`. The placement algorithm selects the first `k + m` eligible nodes (ordered by `registered_at`) and assigns shard `i` to `eligible_nodes[i]`:
+**Current implementation:** Node addresses are stored in a PostgreSQL `nodes` table managed by `MetadataStore`. `placement_strategy` assigns shard `i` to the `i`-th node of the list it is handed:
 
 ```cpp
 PlacementMap placement_strategy(
@@ -38,7 +38,16 @@ PlacementMap placement_strategy(
 
 Nodes can be added and removed at runtime via `MetadataStore::register_node()` / `unregister_node()`. `StorageClient::put()` validates that `eligible_nodes.size() >= k + m` before proceeding.
 
-For `StorageClient::repair()`, candidate targets are the **healthy subset** of registered nodes at repair time (HTTP `GET /health` with the standard transport timeouts). Down-but-registered nodes are excluded from repair placement to avoid failing the repair write path due only to stale registry entries. Repair still prefers unused healthy nodes first, then reuses healthy nodes already holding surviving shards if needed.
+> **Amendment (2026-07-08):** The list handed to `placement_strategy` is no longer the
+> registration-ordered prefix. `StorageClient::put()` now computes an **HRW
+> (rendezvous) intended placement** via `hrw_intended_nodes(object_id,
+> eligible_nodes, k + m)` and passes that, so shard `i` lands on its
+> rendezvous-selected node rather than `eligible_nodes[i]`. Placement is therefore
+> a stable function of the object that spreads writes across the registry, and an
+> operator can migrate objects toward it on demand. See
+> [ADR-0009](0009-rebalancing.md).
+
+For `StorageClient::repair()`, candidate targets are the **healthy subset** of registered nodes at repair time (HTTP `GET /health` with the standard transport timeouts). Down-but-registered nodes are excluded from repair placement to avoid failing the repair write path due only to stale registry entries. As of [ADR-0009](0009-rebalancing.md), repair prefers each reconstructed shard's **HRW-intended node** when that node is healthy, and only falls back to the unused-first, then-reused healthy-node selection when the intended target is down.
 
 ### Write atomicity model: versioned shard keyspace
 
@@ -138,5 +147,5 @@ These timeouts are applied wherever a client is created. Because shard transport
 **Remaining trade-offs:**
 - Thread-local client caches do not evict entries; a long-lived worker thread that touches many unique node addresses retains those clients until thread exit.
 - Versioned writes can leave orphaned shard payloads for write attempts that lose the metadata upsert race, and for same-object `put/remove` interleavings allowed by ADR-0006.
-- Dynamic placement selects the first `k + m` nodes ordered by registration time. No consistent hashing or rebalancing is performed when nodes are added/removed; existing shard locations are not migrated.
+- Placement uses HRW (rendezvous) hashing over the registered nodes ([ADR-0009](0009-rebalancing.md)); it is a stable function of the object rather than a registration-order prefix. Membership changes are still not migrated automatically, but an operator-triggered, version-fenced rebalance can move objects toward their HRW-intended placement on demand (leaving the old copies as inert orphans for a future GC sweep).
 - Repair requires a sufficient number of healthy registered nodes for replacement targets. If too few healthy nodes are available, repair fails before metadata update.

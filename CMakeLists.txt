@@ -51,6 +51,7 @@ if(BUILD_TESTING)
         tests/ErasureCodecTest.cpp
         tests/CryptoTest.cpp
         tests/ModelsTest.cpp
+        tests/ShardTransportTest.cpp
     )
 
     target_link_libraries(pqdos_unit_tests PRIVATE
