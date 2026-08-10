@@ -32,7 +32,7 @@ namespace {
 // Constants
 // =========================
 
-const std::string kDefaultKekFilePath = "/tmp/pqdos_kek.json";
+const std::string kDefaultKekFilePath = "/tmp/myc_kek.json";
 
 // Sentinel node address recorded for shards that were missing at rebuild time
 // (ADR-0008). It is structurally valid ("host:port") so it round-trips through
@@ -41,7 +41,7 @@ const std::string kDefaultKekFilePath = "/tmp/pqdos_kek.json";
 const std::string kUnknownNode = "0.0.0.0:0";
 
 std::string parseKekFilePath() {
-    const char* env = std::getenv("PQDOS_KEYSTORE_PATH");
+    const char* env = std::getenv("MYC_KEYSTORE_PATH");
     if (env) {
         return env;
     }

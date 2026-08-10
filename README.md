@@ -1,14 +1,16 @@
 
-# Post Quantum Distributed Object Store (PQDOS)
+# Mycelium
 
-PQDOS is a C++20 distributed object store designed for a zero-trust model, using ML-KEM-768 for post-quantum key wrapping, AES-256-GCM for data encryption, and ISA-L Reed-Solomon erasure coding for fault tolerance. It stores encrypted shards and metadata in separate backends and exposes a simple HTTP API for reliable object storage and retrieval.
+Mycelium is a C++20 distributed object store named after the fungal network that inspired it. A system with no single point of failure, one that senses damage and regrows itself around it.
 
-Today’s storage encryption still depends on RSA and elliptic-curve cryptography which a capable quantum computer could eventually break. PQDOS explores an alternative aspiring to distributed RAIN (Redundant Array of Independant Nodes) principles and integrating a layer of post-quantum security.
+It splits each object into encrypted, erasure-coded shards spread across independent storage nodes, so any object can be reconstructed from a subset of surviving shards even after node loss. Post-quantum key wrapping (ML-KEM-768) and AES-256-GCM protect data end-to-end in a zero-trust model, while ISA-L Reed-Solomon coding, health checks, and automatic repair/rebalancing keep the cluster self-healing under failure, all exposed through a simple HTTP API.
+
+Today's storage encryption still leans on RSA/ECC, which a capable quantum computer could eventually break. Mycelium builds on RAIN (Redundant Array of Independent Nodes) principles with post-quantum security designed in from the start.
 
 
 ## I. Architecture Overview
 
-Mermaid diagram for runtime wiring and boundaries:
+Diagram for runtime wiring and boundaries:
 
 ```
 [API Consumer]
@@ -71,7 +73,7 @@ Design decisions are documented as ADRs in [docs/adr/](docs/adr/).
 ### Unit Tests
 
 ```bash
-./build/Release/pqdos_unit_tests
+./build/Release/myc_unit_tests
 ```
 
 ### Integration Tests
@@ -83,7 +85,7 @@ Integration tests require PostgreSQL and storage nodes running locally.
 ./scripts/setup-integration.sh
 
 # Run tests
-./build/Release/pqdos_integration_tests
+./build/Release/myc_integration_tests
 
 # Stop all services
 ./scripts/teardown-integration.sh
@@ -238,7 +240,7 @@ Used internally by the client. Each node exposes:
 | GET | `/shards?location=<shard_key>` | - | Retrieve a shard |
 | DELETE | `/shards?location=<shard_key>` | - | Delete a shard |
 
-## VII. Rough Backlog
+## VII. Backlog
 
 * ~~Improve the placement strategy by selecting nodes from those available.~~ &nbsp;&nbsp; Implemented via dynamic node registry, then HRW rendezvous placement ([ADR-0009](docs/adr/0009-rebalancing.md)).
 * ~~Add a repair strategy that operates on a single route.~~ &nbsp;&nbsp; Implemented via `/objects/:id/repair`.

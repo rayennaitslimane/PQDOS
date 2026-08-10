@@ -5,7 +5,7 @@
 
 ## Context
 
-Placement in PQDOS was originally positional: [ADR-0004](0004-shard-transport.md)
+Placement in Mycelium was originally positional: [ADR-0004](0004-shard-transport.md)
 assigned shard `i` to `eligible_nodes[i]`, where `eligible_nodes` is the node
 registry ordered by `registered_at`. This has two consequences that get worse as
 the cluster grows and churns:

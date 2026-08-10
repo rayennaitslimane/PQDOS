@@ -5,7 +5,7 @@
 
 ## Context
 
-PQDOS aspires to distributed RAIN (Redundant Array of Independent Nodes)
+Mycelium aspires to distributed RAIN (Redundant Array of Independent Nodes)
 principles. The data plane already honours this: object bytes are erasure coded
 with ISA-L Reed-Solomon ([ADR-0002](0002-erasure-codec.md)) and scattered as
 `k + m` shards across independent `StorageNode` processes
